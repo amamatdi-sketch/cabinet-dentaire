@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-io'; // Remplacez par votre imp
 
 // Configuration Supabase (remplacée automatiquement par vos variables ou à durcir)
 const SUPABASE_URL = "https://jeidktusskhegocpppw.supabase.co";
-const SUPABASE_KEY = "VOTRE_CLE_ANON_SUPABASE"; // Pensez à remettre votre clé anon ici
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplaWRrdHVzc2toZWdvcGNwcHB3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NTYyODksImV4cCI6MjA5NTQzMjI4OX0.Rzq8yB04besi2RzjbNKB96C5vO6J5QLS5tWaC3dSuVg"; // Pensez à remettre votre clé anon ici
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const TARIFS = {
