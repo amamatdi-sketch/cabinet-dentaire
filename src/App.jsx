@@ -1,83 +1,91 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { createClient } from '@supabase/supabase-js';
+
+const sb = createClient(
+  'https://jeidktusskhegocpppw.supabase.co',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplaWRrdHVzc2toZWdvcGNwcHB3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NTYyODksImV4cCI6MjA5NTQzMjI4OX0.Rzq8yB04besi2RzjbNKB96C5vO6J5QLS5tWaC3dSuVg'
+);
 
 const PRATICIENS = ["Dr. Amin", "Dr. Bossioda"];
-
 const TARIFS = {
-  "Consultation":                  [500],
-  "Extraction adulte":             [1500],
-  "Extraction enfant":             [1000],
-  "Extraction DDS":                [2500],
-  "Chirurgie DDS":                 [12000],
-  "Radio":                         [1000],
-  "Soin":                          [5000],
-  "Detartrage":                    [1000, 2000, 3000, 4000, 5000],
-  "Couronne inox":                 [5000],
-  "Couronne resine":               [6000],
-  "CCM":                           [15000],
-  "ZIR":                           [25000],
-  "Prothese flexible unilaterale": [9000],
-  "Prothese flexible partielle":   [20000, 28000, 36000, 42000],
-  "Prothese totale":               [20000, 36000, 42000, 50000, 60000, 80000, 90000],
-  "Prothese totale sup":           [10000, 18000, 21000, 25000, 30000, 40000, 45000],
-  "Prothese totale inf":           [10000, 18000, 21000, 25000, 30000, 40000, 45000],
+  "Consultation":[500],"Extraction adulte":[1500],"Extraction enfant":[1000],
+  "Extraction DDS":[2500],"Chirurgie DDS":[12000],"Radio":[1000],"Soin":[5000],
+  "Detartrage":[1000,2000,3000,4000,5000],"Couronne inox":[5000],"Couronne resine":[6000],
+  "CCM":[15000],"ZIR":[25000],"Prothese flexible unilaterale":[9000],
+  "Prothese flexible partielle":[20000,28000,36000,42000],
+  "Prothese totale":[20000,36000,42000,50000,60000,80000,90000],
+  "Prothese totale sup":[10000,18000,21000,25000,30000,40000,45000],
+  "Prothese totale inf":[10000,18000,21000,25000,30000,40000,45000],
 };
-
-const STATUTS_RDV = ["Confirme", "En attente", "Present", "Absent", "Annule"];
-const MODES_PAIEMENT = ["Especes", "Virement", "Cheque", "CCP", "Baridi Mob", "Dahabia"];
-
-const fmt   = (n) => Number(n || 0).toLocaleString("fr-DZ") + " DA";
+const STATUTS_RDV = ["Confirme","En attente","Present","Absent","Annule"];
+const MODES_PAIEMENT = ["Especes","Virement","Cheque","CCP","Baridi Mob","Dahabia"];
+const fmt = (n) => Number(n||0).toLocaleString("fr-DZ")+" DA";
 const today = () => new Date().toISOString().split("T")[0];
-const uid   = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-
-function stLoad(key) {
-  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; }
-  catch { return null; }
-}
-function stSave(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
-}
+const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,5);
 
 export default function App() {
-  const [page,     setPage]     = useState("dashboard");
-  const [patients, setPatients] = useState([]);
-  const [actes,    setActes]    = useState([]);
-  const [factures, setFactures] = useState([]);
-  const [rdvs,     setRdvs]     = useState([]);
-  const [ctx,      setCtx]      = useState(null);
-  const [nav,      setNav]      = useState(false);
+  const [page,setPage]=useState("dashboard");
+  const [patients,setPatients]=useState([]);
+  const [actes,setActes]=useState([]);
+  const [factures,setFactures]=useState([]);
+  const [rdvs,setRdvs]=useState([]);
+  const [ctx,setCtx]=useState(null);
+  const [nav,setNav]=useState(false);
+  const [loading,setLoading]=useState(true);
 
-  useEffect(() => {
-    const p = stLoad("cab_patients"); if (p) setPatients(p);
-    const a = stLoad("cab_actes");    if (a) setActes(a);
-    const f = stLoad("cab_factures"); if (f) setFactures(f);
-    const r = stLoad("cab_rdvs");     if (r) setRdvs(r);
+  const loadAll = useCallback(async () => {
+    const [{data:p},{data:a},{data:f},{data:r}] = await Promise.all([
+      sb.from('patients').select('*'),
+      sb.from('actes').select('*'),
+      sb.from('factures').select('*'),
+      sb.from('rdvs').select('*'),
+    ]);
+    setPatients(p||[]); setActes(a||[]); setFactures(f||[]); setRdvs(r||[]);
+    setLoading(false);
   }, []);
 
-  const upP = (d) => { setPatients(d); stSave("cab_patients", d); };
-  const upA = (d) => { setActes(d);    stSave("cab_actes",    d); };
-  const upF = (d) => { setFactures(d); stSave("cab_factures", d); };
-  const upR = (d) => { setRdvs(d);     stSave("cab_rdvs",     d); };
+  useEffect(() => {
+    loadAll();
+    const ch = sb.channel('cab-sync')
+      .on('postgres_changes',{event:'*',schema:'public',table:'patients'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'actes'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'factures'},loadAll)
+      .on('postgres_changes',{event:'*',schema:'public',table:'rdvs'},loadAll)
+      .subscribe();
+    return () => sb.removeChannel(ch);
+  },[loadAll]);
 
-  const go = (p, c = null) => { setPage(p); if (c !== null) setCtx(c); setNav(false); };
+  const go = (p,c=null) => { setPage(p); if(c!==null) setCtx(c); setNav(false); };
+  const addPatient  = async (p) => { await sb.from('patients').insert([p]); await loadAll(); };
+  const addActe     = async (a) => { await sb.from('actes').insert([a]); await loadAll(); };
+  const addFacture  = async (f) => { await sb.from('factures').insert([f]); await loadAll(); };
+  const updFacture  = async (id,ch) => { await sb.from('factures').update(ch).eq('id',id); await loadAll(); };
+  const updActe     = async (id,ch) => { await sb.from('actes').update(ch).eq('id',id); await loadAll(); };
+  const addRdv      = async (r) => { await sb.from('rdvs').insert([r]); await loadAll(); };
+  const updRdv      = async (id,ch) => { await sb.from('rdvs').update(ch).eq('id',id); await loadAll(); };
+  const delRdv      = async (id) => { await sb.from('rdvs').delete().eq('id',id); await loadAll(); };
 
-  const TITLES = {
-    dashboard:"Tableau de bord", patients:"Patients",
-    "patient-detail": ctx ? ctx.nom + " " + ctx.prenom : "Patient",
-    "nouveau-patient":"Nouveau Patient", "nouvel-acte":"Nouvel Acte",
-    facturation:"Facturation", agenda:"Agenda", "nouveau-rdv":"Nouveau RDV",
-  };
+  const TITLES={dashboard:"Tableau de bord",patients:"Patients","patient-detail":ctx?ctx.nom+" "+ctx.prenom:"Patient","nouveau-patient":"Nouveau Patient","nouvel-acte":"Nouvel Acte",facturation:"Facturation",agenda:"Agenda","nouveau-rdv":"Nouveau RDV"};
+  const shared={patients,actes,factures,rdvs,addPatient,addActe,addFacture,updFacture,updActe,addRdv,updRdv,delRdv,go,ctx};
 
-  const shared = { patients, actes, factures, rdvs, upP, upA, upF, upR, go, ctx };
+  if(loading) return(
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#f0f4ff",flexDirection:"column",gap:16}}>
+      <div style={{fontSize:56}}>🦷</div>
+      <div style={{fontFamily:"Georgia,serif",fontSize:20,color:"#1a3c5e",fontWeight:"bold"}}>Chargement...</div>
+      <div style={{fontSize:13,color:"#9ca3af"}}>Connexion a la base de donnees...</div>
+    </div>
+  );
 
-  return (
+  return(
     <div style={{display:"flex",height:"100vh",fontFamily:"'Segoe UI',system-ui,sans-serif",background:"#f0f4ff",overflow:"hidden"}}>
-      {nav && <div onClick={()=>setNav(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:20}}/>}
+      {nav&&<div onClick={()=>setNav(false)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,.45)",zIndex:20}}/>}
       <Sidebar page={page} go={go} open={nav}/>
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
         <header style={{background:"#fff",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,boxShadow:"0 1px 4px rgba(0,0,0,.08)",flexShrink:0}}>
           <button onClick={()=>setNav(true)} style={{background:"none",border:"none",fontSize:22,cursor:"pointer",color:"#1a3c5e"}}>☰</button>
           {page!=="dashboard"&&<button onClick={()=>go(page==="patient-detail"||page==="nouvel-acte"||page==="nouveau-patient"?"patients":page==="nouveau-rdv"?"agenda":"dashboard")} style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:"#888"}}>←</button>}
           <h1 style={{margin:0,fontSize:17,fontWeight:700,color:"#1a3c5e"}}>{TITLES[page]||page}</h1>
+          <div style={{marginLeft:"auto",width:8,height:8,borderRadius:"50%",background:"#22c55e",boxShadow:"0 0 6px #22c55e"}} title="Synchronise"/>
         </header>
         <main style={{flex:1,overflowY:"auto",padding:16}}>
           {page==="dashboard"       && <Dashboard      {...shared}/>}
@@ -237,16 +245,7 @@ function PatientDetail({patients,actes,factures,ctx,go}){
       </div>
       {tab==="dossier"&&(
         <div style={{display:"flex",flexDirection:"column",gap:8}}>
-          {[
-            {label:"Antecedents medicaux",key:"antecedents"},
-            {label:"Traitements en cours",key:"traitements"},
-            {label:"Allergies",key:"allergies"},
-            {label:"Dents traitees",key:"dents"},
-            {label:"Diagnostic dentaire",key:"diagnostic"},
-            {label:"Traitement propose",key:"traitementPropose"},
-            {label:"Etape du traitement",key:"etape"},
-            {label:"Observations",key:"observations"},
-          ].map((f,i)=>(
+          {[{label:"Antecedents medicaux",key:"antecedents"},{label:"Traitements en cours",key:"traitements"},{label:"Allergies",key:"allergies"},{label:"Dents traitees",key:"dents"},{label:"Diagnostic dentaire",key:"diagnostic"},{label:"Traitement propose",key:"traitementPropose"},{label:"Etape du traitement",key:"etape"},{label:"Observations",key:"observations"}].map((f,i)=>(
             <div key={i} style={{background:"#fff",borderRadius:12,padding:"10px 14px",boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}>
               <div style={{fontSize:11,fontWeight:700,color:"#6b7280",marginBottom:4}}>{f.label}</div>
               <div style={{fontSize:13,color:patient[f.key]?"#1a3c5e":"#d1d5db"}}>{patient[f.key]||"—"}</div>
@@ -302,14 +301,17 @@ function PatientDetail({patients,actes,factures,ctx,go}){
   );
 }
 
-function NouveauPatient({patients,upP,go}){
+function NouveauPatient({patients,addPatient,go}){
   const [f,setF]=useState({nom:"",prenom:"",telephone:"",antecedents:"",traitements:"",allergies:"",dents:"",diagnostic:"",traitementPropose:"",etape:"",observations:""});
+  const [saving,setSaving]=useState(false);
   const set=(k,v)=>setF(p=>({...p,[k]:v}));
-  const submit=()=>{
+  const submit=async()=>{
     if(!f.nom.trim()){alert("Le nom est obligatoire");return;}
+    setSaving(true);
     const p={id:uid(),...f,nom:f.nom.toUpperCase().trim(),prenom:f.prenom.trim(),dateCreation:today()};
-    upP([...patients,p]);
+    await addPatient(p);
     go("patient-detail",p);
+    setSaving(false);
   };
   return(
     <div style={{maxWidth:560,margin:"0 auto"}}>
@@ -330,20 +332,23 @@ function NouveauPatient({patients,upP,go}){
         <Field label="Etape du traitement" value={f.etape} onChange={v=>set("etape",v)} placeholder="ex: Seance 1/3"/>
         <Field label="Observations" value={f.observations} onChange={v=>set("observations",v)} multi/>
       </Section>
-      <Btn onClick={submit} color="#1a3c5e" full lg>Enregistrer le patient</Btn>
+      <Btn onClick={submit} color="#1a3c5e" full lg>{saving?"Enregistrement...":"Enregistrer le patient"}</Btn>
     </div>
   );
 }
 
-function NouvelActe({patients,actes,upA,ctx,go}){
+function NouvelActe({patients,actes,addActe,updActe,ctx,go}){
   const first=Object.keys(TARIFS)[0];
   const [f,setF]=useState({patientId:ctx?.id||"",date:today(),praticien:PRATICIENS[0],typeActe:first,prix:TARIFS[first][0],dents:"",diagnostic:"",traitementPropose:"",etape:"",observations:""});
+  const [saving,setSaving]=useState(false);
   const set=(k,v)=>setF(p=>({...p,[k]:v}));
   const onType=(t)=>{set("typeActe",t);set("prix",TARIFS[t][0]);};
-  const submit=()=>{
+  const submit=async()=>{
     if(!f.patientId){alert("Selectionnez un patient");return;}
-    upA([...actes,{id:uid(),...f,facturId:null}]);
+    setSaving(true);
+    await addActe({id:uid(),...f,facturId:null});
     go("patient-detail",patients.find(p=>p.id===f.patientId));
+    setSaving(false);
   };
   const opts=TARIFS[f.typeActe]||[];
   return(
@@ -368,12 +373,12 @@ function NouvelActe({patients,actes,upA,ctx,go}){
         <Field label="Etape" value={f.etape} onChange={v=>set("etape",v)} placeholder="ex: Seance 2/3"/>
         <Field label="Observations" value={f.observations} onChange={v=>set("observations",v)} multi/>
       </Section>
-      <Btn onClick={submit} color="#1a3c5e" full lg>Enregistrer l'acte</Btn>
+      <Btn onClick={submit} color="#1a3c5e" full lg>{saving?"Enregistrement...":"Enregistrer l'acte"}</Btn>
     </div>
   );
 }
 
-function Facturation({patients,actes,factures,upA,upF,ctx,go}){
+function Facturation({patients,actes,factures,addFacture,updFacture,updActe,ctx,go}){
   const [mode,setMode]=useState("creer");
   const [patId,setPatId]=useState(ctx?.id||"");
   const [praticien,setPrat]=useState(PRATICIENS[0]);
@@ -382,28 +387,33 @@ function Facturation({patients,actes,factures,upA,upF,ctx,go}){
   const [modePay,setModePay]=useState(MODES_PAIEMENT[0]);
   const [factId,setFactId]=useState("");
   const [payAjout,setPayAjout]=useState(0);
+  const [saving,setSaving]=useState(false);
   const patient=patients.find(p=>p.id===patId);
   const nf=actes.filter(a=>a.patientId===patId&&!a.facturId);
   const tb=nf.reduce((s,a)=>s+(a.prix||0),0);
   const tn=Math.max(0,tb-remise);
   const re=Math.max(0,tn-acompte);
   const st=re<=0?"Solde":acompte>0?"Partiel":"Impaye";
-  const creer=()=>{
+  const creer=async()=>{
     if(!patId){alert("Selectionnez un patient");return;}
     if(nf.length===0){alert("Aucun acte non facture");return;}
+    setSaving(true);
     const id="FAC-"+Date.now().toString().slice(-6);
-    upF([...factures,{id,patientId:patId,date:today(),praticien,montantBrut:tb,remise,montantNet:tn,montantPaye:acompte,resteAPayer:re,modePaiement:modePay,statut:st}]);
-    upA(actes.map(a=>a.patientId===patId&&!a.facturId?{...a,facturId:id}:a));
+    await addFacture({id,patientId:patId,date:today(),praticien,montantBrut:tb,remise,montantNet:tn,montantPaye:acompte,resteAPayer:re,modePaiement:modePay,statut:st});
+    for(const a of nf) await updActe(a.id,{facturId:id});
+    setSaving(false);
     alert("Facture "+id+" creee\nStatut: "+st+"\nReste: "+fmt(re));
     if(patient) go("patient-detail",patient);
   };
-  const payer=()=>{
+  const payer=async()=>{
     const f=factures.find(x=>x.id===factId);
     if(!f){alert("Facture introuvable");return;}
     if(payAjout<=0){alert("Montant invalide");return;}
+    setSaving(true);
     const np=(f.montantPaye||0)+payAjout;
     const nr=Math.max(0,f.montantNet-np);
-    upF(factures.map(x=>x.id===factId?{...x,montantPaye:np,resteAPayer:nr,statut:nr<=0?"Solde":"Partiel"}:x));
+    await updFacture(factId,{montantPaye:np,resteAPayer:nr,statut:nr<=0?"Solde":"Partiel"});
+    setSaving(false);
     alert("Paiement enregistre\nTotal paye: "+fmt(np)+"\nReste: "+fmt(nr));
     setFactId("");setPayAjout(0);
   };
@@ -440,15 +450,15 @@ function Facturation({patients,actes,factures,upA,upF,ctx,go}){
               <div style={{textAlign:"center",marginTop:8}}><Pill statut={st}/></div>
             </div>
           </>}
-          <Btn onClick={creer} color="#059669" full lg>Creer la facture</Btn>
+          <Btn onClick={creer} color="#059669" full lg>{saving?"Enregistrement...":"Creer la facture"}</Btn>
         </Section>
       )}
       {mode==="payer"&&(
         <Section title="Enregistrer un paiement">
-          <Select label="Facture impayee" value={factId} onChange={setFactId} options={[{value:"",label:"Selectionner..."},...factures.filter(f=>f.resteAPayer>0).map(f=>{const p=patients.find(x=>x.id===f.patientId);return{value:f.id,label:f.id+" — "+(p?p.nom+" "+p.prenom:"?")+" — "+fmt(f.resteAPayer)};})]}/> 
+          <Select label="Facture impayee" value={factId} onChange={setFactId} options={[{value:"",label:"Selectionner..."},...factures.filter(f=>f.resteAPayer>0).map(f=>{const p=patients.find(x=>x.id===f.patientId);return{value:f.id,label:f.id+" — "+(p?p.nom+" "+p.prenom:"?")+" — "+fmt(f.resteAPayer)};})]}/>
           {factId&&(()=>{const f=factures.find(x=>x.id===factId);return f?<div style={{background:"#fef2f2",borderRadius:10,padding:12,fontSize:13}}><Row l="Net a payer" r={fmt(f.montantNet)}/><Row l="Deja paye" r={fmt(f.montantPaye)} color="#059669"/><Row l="Reste" r={fmt(f.resteAPayer)} color="#dc2626" bold/></div>:null;})()}
           <Field label="Montant du paiement (DA)" value={payAjout} onChange={v=>setPayAjout(Number(v))} type="number"/>
-          <Btn onClick={payer} color="#059669" full lg>Enregistrer</Btn>
+          <Btn onClick={payer} color="#059669" full lg>{saving?"Enregistrement...":"Enregistrer"}</Btn>
         </Section>
       )}
       {mode==="impayes"&&(
@@ -465,11 +475,9 @@ function Facturation({patients,actes,factures,upA,upF,ctx,go}){
   );
 }
 
-function Agenda({patients,rdvs,upR,go}){
+function Agenda({patients,rdvs,updRdv,delRdv,go}){
   const [date,setDate]=useState(today());
   const duJour=rdvs.filter(r=>r.date===date).sort((a,b)=>a.heure.localeCompare(b.heure));
-  const updStatut=(id,s)=>upR(rdvs.map(r=>r.id===id?{...r,statut:s}:r));
-  const del=(id)=>{if(window.confirm("Supprimer ce RDV ?")) upR(rdvs.filter(r=>r.id!==id));};
   return(
     <div style={{maxWidth:640,margin:"0 auto"}}>
       <div style={{display:"flex",gap:8,marginBottom:12}}>
@@ -493,10 +501,10 @@ function Agenda({patients,rdvs,upR,go}){
                   <div style={{fontSize:11,color:"#9ca3af"}}>{r.praticien}</div>
                 </div>
                 <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"flex-end"}}>
-                  <select value={r.statut} onChange={e=>updStatut(r.id,e.target.value)} style={{border:"none",borderRadius:20,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer",background:r.statut==="Present"?"#dcfce7":r.statut==="Absent"?"#fee2e2":r.statut==="Annule"?"#f3f4f6":"#dbeafe",color:r.statut==="Present"?"#15803d":r.statut==="Absent"?"#b91c1c":r.statut==="Annule"?"#4b5563":"#1d4ed8"}}>
+                  <select value={r.statut} onChange={e=>updRdv(r.id,{statut:e.target.value})} style={{border:"none",borderRadius:20,padding:"3px 8px",fontSize:11,fontWeight:700,cursor:"pointer",background:r.statut==="Present"?"#dcfce7":r.statut==="Absent"?"#fee2e2":r.statut==="Annule"?"#f3f4f6":"#dbeafe",color:r.statut==="Present"?"#15803d":r.statut==="Absent"?"#b91c1c":r.statut==="Annule"?"#4b5563":"#1d4ed8"}}>
                     {STATUTS_RDV.map(s=><option key={s}>{s}</option>)}
                   </select>
-                  <button onClick={()=>del(r.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:14,color:"#fca5a5"}}>🗑</button>
+                  <button onClick={()=>{if(window.confirm("Supprimer ce RDV ?")) delRdv(r.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:14,color:"#fca5a5"}}>🗑</button>
                 </div>
               </div>
             </div>
@@ -506,14 +514,17 @@ function Agenda({patients,rdvs,upR,go}){
   );
 }
 
-function NouveauRdv({patients,rdvs,upR,ctx,go}){
+function NouveauRdv({patients,addRdv,ctx,go}){
   const [f,setF]=useState({patientId:ctx?.id||"",date:today(),heure:"09:00",duree:30,motif:"",praticien:PRATICIENS[0],statut:"Confirme",notes:""});
+  const [saving,setSaving]=useState(false);
   const set=(k,v)=>setF(p=>({...p,[k]:v}));
-  const submit=()=>{
+  const submit=async()=>{
     if(!f.patientId){alert("Selectionnez un patient");return;}
     if(!f.motif.trim()){alert("Le motif est obligatoire");return;}
-    upR([...rdvs,{id:uid(),...f}]);
+    setSaving(true);
+    await addRdv({id:uid(),...f});
     go("agenda");
+    setSaving(false);
   };
   return(
     <div style={{maxWidth:560,margin:"0 auto"}}>
@@ -530,80 +541,19 @@ function NouveauRdv({patients,rdvs,upR,ctx,go}){
         <Field label="Motif *" value={f.motif} onChange={v=>set("motif",v)} placeholder="Ex: Composite 16, Extraction..."/>
         <Field label="Notes" value={f.notes} onChange={v=>set("notes",v)} multi/>
       </Section>
-      <Btn onClick={submit} color="#6d28d9" full lg>Enregistrer le RDV</Btn>
+      <Btn onClick={submit} color="#6d28d9" full lg>{saving?"Enregistrement...":"Enregistrer le RDV"}</Btn>
     </div>
   );
 }
 
-function Section({title,children}){
-  return(
-    <div style={{background:"#fff",borderRadius:14,padding:"14px 14px 10px",boxShadow:"0 1px 4px rgba(0,0,0,.07)",marginBottom:12}}>
-      {title&&<div style={{fontWeight:700,fontSize:13,color:"#1a3c5e",borderBottom:"1px solid #f0f0f0",paddingBottom:8,marginBottom:12}}>{title}</div>}
-      <div style={{display:"flex",flexDirection:"column",gap:10}}>{children}</div>
-    </div>
-  );
-}
-
+function Section({title,children}){return(<div style={{background:"#fff",borderRadius:14,padding:"14px 14px 10px",boxShadow:"0 1px 4px rgba(0,0,0,.07)",marginBottom:12}}>{title&&<div style={{fontWeight:700,fontSize:13,color:"#1a3c5e",borderBottom:"1px solid #f0f0f0",paddingBottom:8,marginBottom:12}}>{title}</div>}<div style={{display:"flex",flexDirection:"column",gap:10}}>{children}</div></div>);}
 const lbl={display:"block",fontSize:12,fontWeight:600,color:"#374151",marginBottom:4};
 const inp={width:"100%",border:"1.5px solid #e5e7eb",borderRadius:9,padding:"9px 12px",fontSize:14,outline:"none",boxSizing:"border-box",fontFamily:"inherit",background:"#fff"};
-
-function Field({label,value,onChange,type="text",multi,placeholder}){
-  return(
-    <div>
-      <label style={lbl}>{label}</label>
-      {multi
-        ?<textarea value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} rows={2} style={{...inp,resize:"vertical"}}/>
-        :<input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={inp}/>
-      }
-    </div>
-  );
-}
-
-function Select({label,value,onChange,options}){
-  return(
-    <div>
-      {label&&<label style={lbl}>{label}</label>}
-      <select value={value} onChange={e=>onChange(e.target.value)} style={inp}>
-        {options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-      </select>
-    </div>
-  );
-}
-
-function Btn({onClick,color="#1a3c5e",full,lg,children}){
-  return(
-    <button onClick={onClick} style={{background:color,color:"#fff",border:"none",borderRadius:10,cursor:"pointer",padding:lg?"13px 16px":"9px 14px",fontSize:lg?15:13,fontWeight:700,width:full?"100%":"auto",boxShadow:"0 2px 8px "+color+"55",marginTop:lg?4:0}}>{children}</button>
-  );
-}
-
-function Avatar({name,size=36}){
-  const colors=["#1a3c5e","#059669","#6d28d9","#dc2626","#d97706"];
-  const bg=colors[name.charCodeAt(0)%colors.length];
-  return <div style={{width:size,height:size,minWidth:size,borderRadius:"50%",background:bg,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:800,fontSize:size*.4}}>{name[0]}</div>;
-}
-
-function Pill({statut}){
-  const map={"Solde":{bg:"#dcfce7",c:"#15803d"},"Partiel":{bg:"#ffedd5",c:"#c2410c"},"Impaye":{bg:"#fee2e2",c:"#b91c1c"},"Present":{bg:"#dcfce7",c:"#15803d"},"Absent":{bg:"#fee2e2",c:"#b91c1c"},"Annule":{bg:"#f3f4f6",c:"#6b7280"},"Confirme":{bg:"#dbeafe",c:"#1d4ed8"},"En attente":{bg:"#fef9c3",c:"#a16207"}};
-  const s=map[statut]||{bg:"#f3f4f6",c:"#6b7280"};
-  return <span style={{background:s.bg,color:s.c,fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:20}}>{statut}</span>;
-}
-
-function Row({l,r,color,bold,border}){
-  return <div style={{display:"flex",justifyContent:"space-between",fontSize:13,fontWeight:bold?800:400,color:color||"#1a3c5e",borderTop:border?"1px solid #d1fae5":undefined,paddingTop:border?6:0,marginTop:border?4:0}}><span>{l}</span><span>{r}</span></div>;
-}
-
-function Card({title,action,children}){
-  return(
-    <div style={{background:"#fff",borderRadius:14,padding:"14px 14px 10px",boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-        <div style={{fontWeight:700,fontSize:14,color:"#1a3c5e"}}>{title}</div>
-        {action&&<button onClick={action.fn} style={{background:"none",border:"none",color:"#2563eb",fontSize:12,fontWeight:600,cursor:"pointer"}}>{action.label}</button>}
-      </div>
-      {children}
-    </div>
-  );
-}
-
-function Empty({children}){
-  return <div style={{background:"#fff",borderRadius:12,padding:32,textAlign:"center",color:"#9ca3af",fontSize:14}}>{children}</div>;
-}
+function Field({label,value,onChange,type="text",multi,placeholder}){return(<div><label style={lbl}>{label}</label>{multi?<textarea value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} rows={2} style={{...inp,resize:"vertical"}}/>:<input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} style={inp}/>}</div>);}
+function Select({label,value,onChange,options}){return(<div>{label&&<label style={lbl}>{label}</label>}<select value={value} onChange={e=>onChange(e.target.value)} style={inp}>{options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select></div>);}
+function Btn({onClick,color="#1a3c5e",full,lg,children}){return(<button onClick={onClick} style={{background:color,color:"#fff",border:"none",borderRadius:10,cursor:"pointer",padding:lg?"13px 16px":"9px 14px",fontSize:lg?15:13,fontWeight:700,width:full?"100%":"auto",boxShadow:"0 2px 8px "+color+"55",marginTop:lg?4:0}}>{children}</button>);}
+function Avatar({name,size=36}){const colors=["#1a3c5e","#059669","#6d28d9","#dc2626","#d97706"];const bg=colors[name.charCodeAt(0)%colors.length];return <div style={{width:size,height:size,minWidth:size,borderRadius:"50%",background:bg,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:800,fontSize:size*.4}}>{name[0]}</div>;}
+function Pill({statut}){const map={"Solde":{bg:"#dcfce7",c:"#15803d"},"Partiel":{bg:"#ffedd5",c:"#c2410c"},"Impaye":{bg:"#fee2e2",c:"#b91c1c"},"Present":{bg:"#dcfce7",c:"#15803d"},"Absent":{bg:"#fee2e2",c:"#b91c1c"},"Annule":{bg:"#f3f4f6",c:"#6b7280"},"Confirme":{bg:"#dbeafe",c:"#1d4ed8"},"En attente":{bg:"#fef9c3",c:"#a16207"}};const s=map[statut]||{bg:"#f3f4f6",c:"#6b7280"};return <span style={{background:s.bg,color:s.c,fontSize:11,fontWeight:700,padding:"3px 9px",borderRadius:20}}>{statut}</span>;}
+function Row({l,r,color,bold,border}){return <div style={{display:"flex",justifyContent:"space-between",fontSize:13,fontWeight:bold?800:400,color:color||"#1a3c5e",borderTop:border?"1px solid #d1fae5":undefined,paddingTop:border?6:0,marginTop:border?4:0}}><span>{l}</span><span>{r}</span></div>;}
+function Card({title,action,children}){return(<div style={{background:"#fff",borderRadius:14,padding:"14px 14px 10px",boxShadow:"0 1px 4px rgba(0,0,0,.07)"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><div style={{fontWeight:700,fontSize:14,color:"#1a3c5e"}}>{title}</div>{action&&<button onClick={action.fn} style={{background:"none",border:"none",color:"#2563eb",fontSize:12,fontWeight:600,cursor:"pointer"}}>{action.label}</button>}</div>{children}</div>);}
+function Empty({children}){return <div style={{background:"#fff",borderRadius:12,padding:32,textAlign:"center",color:"#9ca3af",fontSize:14}}>{children}</div>;}
