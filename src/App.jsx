@@ -71,6 +71,9 @@ const TYPES = Object.keys(TARIFS);
 const uid  = () => Math.random().toString(36).slice(2,11)+Date.now().toString(36);
 const now  = () => new Date().toISOString().slice(0,10);
 const fmt  = n  => Number(n||0).toLocaleString("fr-DZ")+" DA";
+// ID court lisible : ex "P-3F9A2B"
+const patCode = id => "P-" + (id||"").slice(0,6).toUpperCase();
+
 const getAllSessions = (all,ref) => all.filter(a=>(a.traitementRef||a.id)===ref);
 const getTreatSummary = (all,ref) => {
   const sessions = getAllSessions(all,ref);
@@ -385,8 +388,12 @@ function Dashboard({patients,actes}){
 
 // ══ PATIENTS ═══════════════════════════════════════════════════════════════════
 function PatientsPage({patients,actes,onNew,onEdit,onDelete,onEditVersement,onTerminate}){
-  const [search,setSearch]=useState(""); const [selId,setSelId]=useState(null);
-  const list=patients.filter(p=>`${p.nom||""} ${p.prenom||""} ${p.telephone||""} ${p.dateNaissance||""}`.toLowerCase().includes(search.toLowerCase()));
+  const [search,setSearch]=useState("");
+  const [selId,setSelId]=useState(null);
+  const list=patients.filter(p=>{
+    const q=search.toLowerCase();
+    return `${p.nom||""} ${p.prenom||""} ${p.telephone||""} ${patCode(p.id)}`.toLowerCase().includes(q);
+  });
   const sel=patients.find(p=>p.id===selId);
   return(
     <div style={S.splitView}>
@@ -395,12 +402,20 @@ function PatientsPage({patients,actes,onNew,onEdit,onDelete,onEditVersement,onTe
           <h2 style={{margin:0,fontSize:14,fontWeight:700,color:"#0f172a"}}>Patients ({patients.length})</h2>
           <button style={S.btnBlue} onClick={onNew}>+ Nouveau</button>
         </div>
-        <input style={S.searchBox} placeholder="🔍 Rechercher…" value={search} onChange={e=>setSearch(e.target.value)}/>
+        <input style={S.searchBox} placeholder="🔍 Nom, prénom, ID…" value={search} onChange={e=>setSearch(e.target.value)}/>
         <div style={S.scrollList}>
           {list.map(p=>(
             <div key={p.id} style={{...S.patRow,...(selId===p.id?S.patRowOn:{})}} onClick={()=>setSelId(p.id)}>
               <div style={S.avatar}>{p.prenom?.[0]||"?"}{p.nom?.[0]||""}</div>
-              <div><div style={S.patName}>{p.prenom} {p.nom}</div><div style={S.patSub}>{p.telephone||"Pas de téléphone"}{p.dateNaissance?" · "+p.dateNaissance:""}</div></div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={S.patName}>{p.prenom} {p.nom}</div>
+                <div style={{display:"flex",alignItems:"center",gap:5,marginTop:2}}>
+                  <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:8,fontFamily:"monospace",letterSpacing:0.5}}>
+                    {patCode(p.id)}
+                  </span>
+                  <span style={S.patSub}>{p.telephone||"—"}</span>
+                </div>
+              </div>
             </div>
           ))}
           {list.length===0&&<div style={S.empty}>Aucun patient</div>}
@@ -430,7 +445,12 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
     <div style={S.ficheWrap}>
       <div style={S.ficheHead}>
         <div>
-          <h2 style={S.ficheTitle}>{patient.prenom} {patient.nom}</h2>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+            <h2 style={S.ficheTitle}>{patient.prenom} {patient.nom}</h2>
+            <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:10,fontFamily:"monospace",letterSpacing:0.5,flexShrink:0}}>
+              {patCode(patient.id)}
+            </span>
+          </div>
           <div style={{color:"#64748b",fontSize:12}}>{patient.dateCreation?`Depuis ${patient.dateCreation}`:""}</div>
         </div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -533,10 +553,16 @@ function PatientModal({patient,onClose,onSave}){
   );
 }
 
+
 // ══ ACTES PAGE ══════════════════════════════════════════════════════════════════
 function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
-  const [filterPat,setFilterPat]=useState("");
-  const filtered=actes.filter(a=>!filterPat||a.patientId===filterPat);
+  const [search,setSearch]=useState("");
+  const q=search.toLowerCase().trim();
+  // Filtrer par nom, prénom ou ID patient
+  const matchedPatIds = q
+    ? new Set(patients.filter(p=>`${p.prenom||""} ${p.nom||""} ${patCode(p.id)}`.toLowerCase().includes(q)).map(p=>p.id))
+    : null;
+  const filtered=actes.filter(a=>!matchedPatIds||matchedPatIds.has(a.patientId));
   const groups={};
   filtered.forEach(a=>{const k=a.traitementRef||a.id;if(!groups[k])groups[k]=[];groups[k].push(a);});
   return(
@@ -545,11 +571,14 @@ function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
         <h1 style={S.pageTitle}>Actes Cliniques</h1>
         <button style={S.btnBlue} onClick={onNew}>+ Nouvelle Séance</button>
       </div>
-      <select style={S.filterSel} value={filterPat} onChange={e=>setFilterPat(e.target.value)}>
-        <option value="">Tous les patients</option>
-        {patients.map(p=><option key={p.id} value={p.id}>{p.prenom} {p.nom}</option>)}
-      </select>
-      {Object.keys(groups).length===0&&<div style={S.empty}>Aucun acte enregistré</div>}
+      {/* Barre de recherche */}
+      <input
+        style={{...S.searchBox,margin:"0 0 12px",width:"100%",maxWidth:380,boxSizing:"border-box",fontSize:13}}
+        placeholder="🔍 Rechercher par nom, prénom ou ID (ex: P-3F9A2B)…"
+        value={search}
+        onChange={e=>setSearch(e.target.value)}
+      />
+      {Object.keys(groups).length===0&&<div style={S.empty}>{q?"Aucun résultat pour « "+search+" »":"Aucun acte enregistré"}</div>}
       {Object.entries(groups).map(([ref])=>{
         const {sorted,prixTotal,totalRemise,netPrice,totalVerse,reste,termine}=getTreatSummary(actes,ref);
         const first=sorted[0];
@@ -560,6 +589,11 @@ function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
               <div>
                 <div style={{fontWeight:700,fontSize:14,display:"flex",alignItems:"center",gap:6}}>
                   {patient?`${patient.prenom} ${patient.nom}`:"—"}
+                  {patient&&(
+                    <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:8,fontFamily:"monospace"}}>
+                      {patCode(patient.id)}
+                    </span>
+                  )}
                   {termine&&<span style={S.pill("#f1f5f9","#64748b")}>Terminé</span>}
                 </div>
                 <div style={{fontSize:12,color:"#64748b"}}>{first.typeActe}{first.dents?` — Dent ${first.dents}`:""}{(first.quantite||1)>1?` × ${first.quantite}`:""}</div>
