@@ -1,14 +1,86 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
+import Dexie from "dexie";
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const SUPABASE_URL = "https://jeidktusskhegopcpppw.supabase.co";
-const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplaWRrdHVzc2toZWdvcGNwcHB3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NTYyODksImV4cCI6MjA5NTQzMjI4OX0.Rzq8yB04besi2RzjbNKB96C5vO6J5QLS5tWaC3dSuVg";   // ← gardez votre clé
-const LOGIN_USER   = "admin";                      // ← changez
-const LOGIN_PASS   = "cabinet2026";                // ← changez
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplaWRrdHVzc2toZWdvcGNwcHB3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NTYyODksImV4cCI6MjA5NTQzMjI4OX0.Rzq8yB04besi2RzjbNKB96C5vO6J5QLS5tWaC3dSuVg";
+const LOGIN_USER   = "admin";
+const LOGIN_PASS   = "cabinet2026";
 
-const db = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ─── BASE DE DONNÉES LOCALE (IndexedDB via Dexie) ─────────────────────────────
+const localDB = new Dexie("CabinetDentaire_v1");
+localDB.version(1).stores({
+  patients:  "id, nom, prenom, dateCreation",
+  actes:     "id, patientId, date, traitementRef",
+  syncQueue: "++id, tableName, action, timestamp",
+});
+
+// ─── FILE DE SYNCHRONISATION ──────────────────────────────────────────────────
+async function enqueue(tableName, action, payload) {
+  await localDB.syncQueue.add({
+    tableName,
+    action,
+    payload: JSON.stringify(payload),
+    timestamp: Date.now(),
+  });
+}
+
+async function flushQueue(onProgress) {
+  const pending = await localDB.syncQueue.orderBy("timestamp").toArray();
+  if (pending.length === 0) return true;
+
+  let done = 0;
+  onProgress && onProgress({ active: true, total: pending.length, done });
+
+  for (const op of pending) {
+    try {
+      const payload = JSON.parse(op.payload);
+
+      if (op.action === "UPSERT") {
+        const { error } = await supabase.from(op.tableName).upsert(payload);
+        if (error) throw error;
+      } else if (op.action === "DELETE_ID") {
+        const { error } = await supabase.from(op.tableName).delete().eq("id", payload.id);
+        if (error) throw error;
+      } else if (op.action === "DELETE_WHERE") {
+        const { error } = await supabase.from(op.tableName).delete().eq(payload.col, payload.val);
+        if (error) throw error;
+      } else if (op.action === "UPDATE_WHERE") {
+        const { error } = await supabase.from(op.tableName).update(payload.updates).eq(payload.col, payload.val);
+        if (error) throw error;
+      }
+
+      await localDB.syncQueue.delete(op.id);
+      done++;
+      onProgress && onProgress({ active: true, total: pending.length, done });
+    } catch (err) {
+      console.error(`❌ Sync error [${op.tableName}/${op.action}]:`, err);
+    }
+  }
+
+  onProgress && onProgress({ active: false, total: 0, done: 0 });
+  return true;
+}
+
+async function pullFromSupabase() {
+  try {
+    const [{ data: pts, error: e1 }, { data: acts, error: e2 }] = await Promise.all([
+      supabase.from("patients").select("*").order("dateCreation", { ascending: false }),
+      supabase.from("actes").select("*").order("date", { ascending: false }),
+    ]);
+    if (e1 || e2) return false;
+    if (pts) { await localDB.patients.clear(); if (pts.length > 0) await localDB.patients.bulkPut(pts); }
+    if (acts) { await localDB.actes.clear(); if (acts.length > 0) await localDB.actes.bulkPut(acts); }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── UTILITAIRES ─────────────────────────────────────────────────────────────
 const TARIFS = {
   "Consultation":[500],"Extraction adulte":[1500],"Extraction enfant":[1000],
   "Extraction DDS":[2500],"Chirurgie DDS":[12000],"Radio":[1000],"Soin":[5000],
@@ -41,70 +113,226 @@ const getTreatSummary = (all,ref) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(()=>localStorage.getItem("cab_auth")==="1");
-  const [praticien,setPraticien]= useState(localStorage.getItem("cab_prat")||"Dr. Amin");
-  const [page,     setPage]     = useState("dashboard");
-  const [patients, setPatients] = useState([]);
-  const [actes,    setActes]    = useState([]);
-  const [connected,setConnected]= useState(false);
-  const [loading,  setLoading]  = useState(true);
-  const [modal,    setModal]    = useState(null);
-  const [mData,    setMData]    = useState(null);
+  const [loggedIn,   setLoggedIn]   = useState(()=>localStorage.getItem("cab_auth")==="1");
+  const [praticien,  setPraticien]  = useState(localStorage.getItem("cab_prat")||"Dr. Amin");
+  const [page,       setPage]       = useState("dashboard");
+  const [patients,   setPatients]   = useState([]);
+  const [actes,      setActes]      = useState([]);
+  const [loading,    setLoading]    = useState(true);
+  const [modal,      setModal]      = useState(null);
+  const [mData,      setMData]      = useState(null);
 
-  useEffect(()=>{
-    if(!loggedIn) return;
-    loadAll();
-    const ch = db.channel("rt")
-      .on("postgres_changes",{event:"*",schema:"public",table:"patients"},()=>loadPatients())
-      .on("postgres_changes",{event:"*",schema:"public",table:"actes"},   ()=>loadActes())
-      .subscribe(s=>setConnected(s==="SUBSCRIBED"));
-    return ()=>db.removeChannel(ch);
-  },[loggedIn]);
+  // ── Statut réseau / sync ──────────────────────────────────────────────────
+  const [isOnline,   setIsOnline]   = useState(navigator.onLine);
+  const [syncState,  setSyncState]  = useState({ active: false, total: 0, done: 0 });
+  const [pendingCount, setPendingCount] = useState(0);
+  const [lastSync,   setLastSync]   = useState(null);
+  const [showSyncToast, setShowSyncToast] = useState(false);
+  const syncTimerRef = useRef(null);
 
-  const loadAll      = async()=>{ setLoading(true); await Promise.all([loadPatients(),loadActes()]); setLoading(false); };
-  const loadPatients = async()=>{ const {data}=await db.from("patients").select("*").order("dateCreation",{ascending:false}); if(data) setPatients(data); };
-  const loadActes    = async()=>{ const {data}=await db.from("actes").select("*").order("date",{ascending:false}); if(data) setActes(data); };
-  const close        = ()=>{ setModal(null); setMData(null); };
-
-  const deletePatient = async id=>{
-    if(!confirm("Supprimer ce patient et toutes ses données ?")) return;
-    await db.from("actes").delete().eq("patientId",id);
-    await db.from("patients").delete().eq("id",id);
-    loadAll();
-  };
-  const deleteActe = async id=>{
-    if(!confirm("Supprimer cet acte ?")) return;
-    await db.from("actes").delete().eq("id",id); loadActes();
-  };
-  const terminateTraitement = async ref=>{
-    if(!confirm("Marquer ce traitement comme terminé ?")) return;
-    await db.from("actes").update({statut:"terminé"}).eq("traitementRef",ref);
-    loadActes();
+  // ── Chargement depuis IndexedDB local (fonctionne toujours, même hors-ligne) ─
+  const loadLocal = async () => {
+    const [pts, acts] = await Promise.all([
+      localDB.patients.orderBy("dateCreation").reverse().toArray(),
+      localDB.actes.orderBy("date").reverse().toArray(),
+    ]);
+    setPatients(pts);
+    setActes(acts);
   };
 
-  if(!loggedIn) return <LoginPage onLogin={(u,p)=>{
-    if(u===LOGIN_USER && p===LOGIN_PASS){ localStorage.setItem("cab_auth","1"); setLoggedIn(true); }
-    else alert("Identifiants incorrects");
-  }}/>;
+  const refreshPendingCount = async () => {
+    const count = await localDB.syncQueue.count();
+    setPendingCount(count);
+  };
 
-  const logout=()=>{ localStorage.removeItem("cab_auth"); setLoggedIn(false); };
+  // ── Synchronisation complète : flush local → pull serveur ─────────────────
+  const syncWithServer = async () => {
+    if (!navigator.onLine) return;
+    try {
+      await flushQueue(state => setSyncState(state));
+      await pullFromSupabase();
+      await loadLocal();
+      await refreshPendingCount();
+      setLastSync(new Date().toLocaleTimeString("fr-DZ"));
+      setShowSyncToast(true);
+      clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = setTimeout(() => setShowSyncToast(false), 3000);
+    } catch (err) {
+      console.error("syncWithServer error:", err);
+    }
+  };
 
-  const nav=[
-    {id:"dashboard",label:"Tableau de bord",icon:"📊"},
-    {id:"patients", label:"Patients",        icon:"👥"},
-    {id:"actes",    label:"Actes Cliniques", icon:"🦷"},
+  // ── Démarrage de l'app ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!loggedIn) return;
+    (async () => {
+      setLoading(true);
+      await loadLocal();          // Chargement immédiat depuis IndexedDB
+      setLoading(false);
+      await refreshPendingCount();
+      if (navigator.onLine) {
+        await syncWithServer();   // Sync au démarrage si connecté
+      }
+    })();
+  }, [loggedIn]);
+
+  // ── Écoute des événements réseau ──────────────────────────────────────────
+  useEffect(() => {
+    const handleOnline = async () => {
+      setIsOnline(true);
+      await syncWithServer();
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+    window.addEventListener("online",  handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online",  handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  // ── Realtime Supabase (uniquement quand connecté) ─────────────────────────
+  useEffect(() => {
+    if (!loggedIn || !isOnline) return;
+    const ch = supabase.channel("rt")
+      .on("postgres_changes",{event:"*",schema:"public",table:"patients"},async ()=>{ await pullFromSupabase(); await loadLocal(); })
+      .on("postgres_changes",{event:"*",schema:"public",table:"actes"},   async ()=>{ await pullFromSupabase(); await loadLocal(); })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [loggedIn, isOnline]);
+
+  const close = () => { setModal(null); setMData(null); };
+
+  // ─── OPÉRATIONS OFFLINE-FIRST ─────────────────────────────────────────────
+
+  const savePatient = async (data) => {
+    await localDB.patients.put(data);
+    if (isOnline) {
+      await supabase.from("patients").upsert(data);
+    } else {
+      await enqueue("patients", "UPSERT", data);
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  const saveActes = async (list) => {
+    await localDB.actes.bulkPut(list);
+    if (isOnline) {
+      await supabase.from("actes").upsert(list);
+    } else {
+      for (const a of list) await enqueue("actes", "UPSERT", a);
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  const updateActe = async (id, data) => {
+    await localDB.actes.update(id, data);
+    if (isOnline) {
+      await supabase.from("actes").update(data).eq("id", id);
+    } else {
+      const existing = await localDB.actes.get(id);
+      await enqueue("actes", "UPSERT", { ...existing, ...data });
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  const deletePatient = async (id) => {
+    if (!confirm("Supprimer ce patient et toutes ses données ?")) return;
+    await localDB.actes.where("patientId").equals(id).delete();
+    await localDB.patients.delete(id);
+    if (isOnline) {
+      await supabase.from("actes").delete().eq("patientId", id);
+      await supabase.from("patients").delete().eq("id", id);
+    } else {
+      await enqueue("actes",    "DELETE_WHERE", { col: "patientId", val: id });
+      await enqueue("patients", "DELETE_ID",    { id });
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  const deleteActe = async (id) => {
+    if (!confirm("Supprimer cet acte ?")) return;
+    await localDB.actes.delete(id);
+    if (isOnline) {
+      await supabase.from("actes").delete().eq("id", id);
+    } else {
+      await enqueue("actes", "DELETE_ID", { id });
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  const terminateTraitement = async (ref) => {
+    if (!confirm("Marquer ce traitement comme terminé ?")) return;
+    await localDB.actes.where("traitementRef").equals(ref).modify({ statut: "terminé" });
+    if (isOnline) {
+      await supabase.from("actes").update({ statut: "terminé" }).eq("traitementRef", ref);
+    } else {
+      await enqueue("actes", "UPDATE_WHERE", { col: "traitementRef", val: ref, updates: { statut: "terminé" } });
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+  if (!loggedIn) return (
+    <LoginPage onLogin={(u,p)=>{
+      if (u===LOGIN_USER && p===LOGIN_PASS) { localStorage.setItem("cab_auth","1"); setLoggedIn(true); }
+      else alert("Identifiants incorrects");
+    }}/>
+  );
+
+  const logout = () => { localStorage.removeItem("cab_auth"); setLoggedIn(false); };
+
+  const nav = [
+    {id:"dashboard", label:"Tableau de bord", icon:"📊"},
+    {id:"patients",  label:"Patients",         icon:"👥"},
+    {id:"actes",     label:"Actes Cliniques",  icon:"🦷"},
   ];
 
-  return(
+  return (
     <div style={S.app}>
+
+      {/* ── Bannière hors-ligne ── */}
+      {!isOnline && (
+        <div style={S.offlineBanner}>
+          📴 Mode hors-ligne — Vos données sont sauvegardées localement
+          {pendingCount > 0 && <span style={S.pendingBadge}>{pendingCount} en attente</span>}
+        </div>
+      )}
+
+      {/* ── Toast sync réussie ── */}
+      {showSyncToast && (
+        <div style={S.syncToast}>✅ Synchronisation terminée — {lastSync}</div>
+      )}
+
+      {/* ── Bannière sync en cours ── */}
+      {syncState.active && (
+        <div style={S.syncBanner}>
+          🔄 Synchronisation… {syncState.done}/{syncState.total} opération(s)
+        </div>
+      )}
+
       <nav style={S.sidebar}>
         <div style={S.sideTop}>
           <span style={{fontSize:26}}>🦷</span>
-          <div><div style={S.siName}>Cabinet Dentaire</div><div style={S.siRole}>{praticien}</div></div>
+          <div>
+            <div style={S.siName}>Cabinet Dentaire</div>
+            <div style={S.siRole}>{praticien}</div>
+          </div>
         </div>
+
         <select style={S.pratSel} value={praticien} onChange={e=>{setPraticien(e.target.value);localStorage.setItem("cab_prat",e.target.value);}}>
-          <option>Dr. Amin</option><option>Dr. Bossioda</option>
+          <option>Dr. Amin</option>
+          <option>Dr. Bossioda</option>
         </select>
+
         <div style={{flex:1,display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
           {nav.map(n=>(
             <button key={n.id} style={{...S.navBtn,...(page===n.id?S.navOn:{})}} onClick={()=>setPage(n.id)}>
@@ -112,45 +340,103 @@ export default function App() {
             </button>
           ))}
         </div>
+
         <div>
-          <div style={{fontSize:11,color:"#475569",padding:"0 8px",marginBottom:6}}>
-            <span style={{color:connected?"#22c55e":"#f59e0b"}}>●</span> {connected?"Connecté":"Connexion…"}
+          {/* Statut réseau */}
+          <div style={{fontSize:11,padding:"8px 8px 4px",borderTop:"1px solid #1e293b",marginBottom:4}}>
+            <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:3}}>
+              <span style={{
+                width:8,height:8,borderRadius:"50%",flexShrink:0,
+                background:isOnline?"#22c55e":"#ef4444",
+                boxShadow:isOnline?"0 0 6px #22c55e":"0 0 6px #ef4444",
+              }}/>
+              <span style={{color:isOnline?"#22c55e":"#ef4444",fontWeight:600}}>
+                {isOnline ? "En ligne" : "Hors-ligne"}
+              </span>
+            </div>
+            {pendingCount > 0 && (
+              <div style={{color:"#f59e0b",fontSize:10,paddingLeft:13}}>
+                ⏳ {pendingCount} op. en attente
+              </div>
+            )}
+            {lastSync && isOnline && (
+              <div style={{color:"#475569",fontSize:10,paddingLeft:13}}>
+                Sync: {lastSync}
+              </div>
+            )}
           </div>
+
+          {/* Bouton sync manuel */}
+          {isOnline && (
+            <button style={S.syncBtn} onClick={syncWithServer} disabled={syncState.active}>
+              {syncState.active ? "⏳ Sync…" : "🔄 Synchroniser"}
+            </button>
+          )}
+
           <button style={S.logoutBtn} onClick={logout}>🔒 Déconnexion</button>
         </div>
       </nav>
 
       <main style={S.main}>
-        {loading?<div style={S.loader}>⏳ Chargement…</div>:<>
+        {loading ? <div style={S.loader}>⏳ Chargement…</div> : <>
           {page==="dashboard" && <Dashboard patients={patients} actes={actes}/>}
-          {page==="patients"  && <PatientsPage patients={patients} actes={actes}
-            onNew={()=>setModal("newPat")}
-            onEdit={p=>{setModal("editPat");setMData(p);}}
-            onDelete={deletePatient}
-            onEditVersement={a=>{setModal("editVers");setMData(a);}}
-            onTerminate={terminateTraitement}
-          />}
-          {page==="actes" && <ActesPage patients={patients} actes={actes}
-            onNew={()=>setModal("newActe")}
-            onDelete={deleteActe}
-            onEdit={a=>{setModal("editActe");setMData(a);}}
-            onTerminate={terminateTraitement}
-          />}
+          {page==="patients"  && (
+            <PatientsPage patients={patients} actes={actes}
+              onNew={()=>setModal("newPat")}
+              onEdit={p=>{setModal("editPat");setMData(p);}}
+              onDelete={deletePatient}
+              onEditVersement={a=>{setModal("editVers");setMData(a);}}
+              onTerminate={terminateTraitement}
+            />
+          )}
+          {page==="actes" && (
+            <ActesPage patients={patients} actes={actes}
+              onNew={()=>setModal("newActe")}
+              onDelete={deleteActe}
+              onEdit={a=>{setModal("editActe");setMData(a);}}
+              onTerminate={terminateTraitement}
+            />
+          )}
         </>}
       </main>
 
-      {modal==="newPat"   && <PatientModal onClose={close} onSave={async d=>{
-            const exists=patients.find(p=>p.nom.toLowerCase()===d.nom.toLowerCase()&&p.prenom.toLowerCase()===d.prenom.toLowerCase());
-            if(exists){alert("⚠️ Ce patient existe déjà : "+d.prenom+" "+d.nom);return;}
-            await db.from("patients").insert([{...d,id:uid(),dateCreation:now()}]);close();loadPatients();
-          }}/>}
-      {modal==="editPat"  && mData && <PatientModal patient={mData} onClose={close} onSave={async d=>{await db.from("patients").update(d).eq("id",mData.id);close();loadPatients();}}/>}
-      {modal==="newActe"  && <ActeModal patients={patients} actes={actes} praticien={praticien} onClose={close}
-        onSave={async list=>{await db.from("actes").insert(list);close();loadActes();}}/>}
-      {modal==="editActe" && mData && <EditActeModal acte={mData} onClose={close}
-        onSave={async d=>{await db.from("actes").update(d).eq("id",mData.id);close();loadActes();}}/>}
-      {modal==="editVers" && mData && <EditVersementModal acte={mData} onClose={close}
-        onSave={async v=>{await db.from("actes").update({montantVerse:v}).eq("id",mData.id);close();loadActes();}}/>}
+      {modal==="newPat" && (
+        <PatientModal onClose={close} onSave={async d=>{
+          const exists = patients.find(p=>
+            p.nom.toLowerCase()===d.nom.toLowerCase() &&
+            p.prenom.toLowerCase()===d.prenom.toLowerCase()
+          );
+          if (exists) { alert("⚠️ Ce patient existe déjà : "+d.prenom+" "+d.nom); return; }
+          const newPat = { ...d, id: uid(), dateCreation: now() };
+          await savePatient(newPat);
+          close();
+        }}/>
+      )}
+
+      {modal==="editPat" && mData && (
+        <PatientModal patient={mData} onClose={close} onSave={async d=>{
+          await savePatient({ ...mData, ...d });
+          close();
+        }}/>
+      )}
+
+      {modal==="newActe" && (
+        <ActeModal patients={patients} actes={actes} praticien={praticien} onClose={close}
+          onSave={async list=>{ await saveActes(list); close(); }}
+        />
+      )}
+
+      {modal==="editActe" && mData && (
+        <EditActeModal acte={mData} onClose={close}
+          onSave={async d=>{ await updateActe(mData.id, d); close(); }}
+        />
+      )}
+
+      {modal==="editVers" && mData && (
+        <EditVersementModal acte={mData} onClose={close}
+          onSave={async v=>{ await updateActe(mData.id, { montantVerse: v }); close(); }}
+        />
+      )}
     </div>
   );
 }
@@ -224,7 +510,7 @@ function PatientsPage({patients,actes,onNew,onEdit,onDelete,onEditVersement,onTe
           {list.map(p=>(
             <div key={p.id} style={{...S.patRow,...(selId===p.id?S.patRowOn:{})}} onClick={()=>setSelId(p.id)}>
               <div style={S.avatar}>{p.prenom?.[0]||"?"}{p.nom?.[0]||""}</div>
-              <div><div style={S.patName}>{p.prenom} {p.nom}</div><div style={S.patSub}>{p.telephone||"Pas de téléphone"}{p.dateNaissance ? " · "+p.dateNaissance : ""}</div></div>
+              <div><div style={S.patName}>{p.prenom} {p.nom}</div><div style={S.patSub}>{p.telephone||"Pas de téléphone"}{p.dateNaissance?" · "+p.dateNaissance:""}</div></div>
             </div>
           ))}
           {list.length===0&&<div style={S.empty}>Aucun patient</div>}
@@ -244,8 +530,6 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
   const groups={};
   actes.forEach(a=>{const k=a.traitementRef||a.id;if(!groups[k])groups[k]=[];groups[k].push(a);});
   const refs=Object.keys(groups);
-
-  // Récapitulatif financier
   let totalPlan=0,totalPaye=0;
   refs.forEach(ref=>{ const {netPrice,totalVerse}=getTreatSummary(allActes,ref); totalPlan+=netPrice; totalPaye+=totalVerse; });
   const totalReste=Math.max(0,totalPlan-totalPaye);
@@ -270,7 +554,6 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
         ))}
       </div>
 
-      {/* ══ RÉCAPITULATIF FINANCIER ══ */}
       {refs.length>0&&(
         <div style={S.finSummary}>
           <div style={S.finItem}><span>💰 Total des soins</span><b style={{color:"#1e40af"}}>{fmt(totalPlan)}</b></div>
@@ -297,8 +580,6 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
                 {reste<=0?"✅ Soldé":`⚠️ Reste: ${fmt(reste)}`}
               </span>
             </div>
-
-            {/* Tableau des séances */}
             <div style={{overflowX:"auto"}}>
               <table style={S.table}>
                 <thead>
@@ -325,7 +606,6 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
                 </tbody>
               </table>
             </div>
-
             <div style={S.treatFoot}>
               Plan: <b>{fmt(prixTotal)}</b>
               {totalRemise>0&&<> | Remise: <b style={{color:"#16a34a"}}>-{fmt(totalRemise)}</b></>}
@@ -352,7 +632,10 @@ function PatientModal({patient,onClose,onSave}){
         <div style={S.fGroup}><label style={S.fLabel}>Nom *</label><input style={S.fInput} value={f.nom} onChange={e=>set("nom",e.target.value)}/></div>
       </div>
       <div style={S.fGroup}><label style={S.fLabel}>📞 Téléphone</label><input style={S.fInput} value={f.telephone} onChange={e=>set("telephone",e.target.value)} placeholder="0555 000 000"/></div>
-      <div style={S.formRow}><div style={S.fGroup}><label style={S.fLabel}>🎂 Date de naissance</label><input style={S.fInput} type="date" value={f.dateNaissance} onChange={e=>set("dateNaissance",e.target.value)}/></div><div style={S.fGroup}><label style={S.fLabel}>⚠️ Allergies</label><input style={S.fInput} value={f.allergies} onChange={e=>set("allergies",e.target.value)}/></div></div>
+      <div style={S.formRow}>
+        <div style={S.fGroup}><label style={S.fLabel}>🎂 Date de naissance</label><input style={S.fInput} type="date" value={f.dateNaissance} onChange={e=>set("dateNaissance",e.target.value)}/></div>
+        <div style={S.fGroup}><label style={S.fLabel}>⚠️ Allergies</label><input style={S.fInput} value={f.allergies} onChange={e=>set("allergies",e.target.value)}/></div>
+      </div>
       <div style={S.fGroup}><label style={S.fLabel}>🩺 Antécédents</label><textarea style={S.fTextarea} rows={2} value={f.antecedents} onChange={e=>set("antecedents",e.target.value)}/></div>
       <div style={S.fGroup}><label style={S.fLabel}>💊 Traitements en cours</label><textarea style={S.fTextarea} rows={2} value={f.traitements} onChange={e=>set("traitements",e.target.value)}/></div>
       <div style={S.mAct}>
@@ -421,7 +704,6 @@ function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
 }
 
 // ══ MODAL NOUVELLE SÉANCE ══════════════════════════════════════════════════════
-// Chaque item a ses propres : étape, diagnostic, observations, versement, remise
 function ActeModal({patients,actes,praticien,onClose,onSave}){
   const [patientId, setPatientId] = useState("");
   const [date,      setDate]      = useState(now());
@@ -435,7 +717,6 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
     return sessions.some(s=>!s.statut||s.statut==="en_cours");
   });
 
-  // Item par défaut
   const newItem = (type) => type==="continuer"
     ? {type:"continuer", ref:"", etape:"", diagnostic:"", observations:"", versement:"", remise:0}
     : {type:"nouveau", typeActe:"Soin", dents:"", quantite:1, prixUnitaire:5000, etape:"", diagnostic:"", observations:"", versement:"", remise:0};
@@ -486,7 +767,6 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
 
   return(
     <Modal title="Nouvelle Séance Clinique" onClose={onClose} wide>
-      {/* Patient + Date */}
       <div style={S.formRow}>
         <div style={S.fGroup}><label style={S.fLabel}>Patient *</label>
           <select style={S.fInput} value={patientId} onChange={e=>{setPatientId(e.target.value);setItems([]);}}>
@@ -499,7 +779,6 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
         </div>
       </div>
 
-      {/* Boutons d'ajout */}
       {patientId&&(
         <div style={S.modeRow}>
           {openList.length>0&&(
@@ -513,10 +792,8 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
         </div>
       )}
 
-      {/* Items — chacun avec ses propres champs */}
       {items.map((item,i)=>(
         <div key={i} style={S.itemCard}>
-          {/* En-tête item */}
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
             <span style={item.type==="continuer"?S.pill("#dbeafe","#1e40af"):S.pill("#ede9fe","#6d28d9")}>
               {item.type==="continuer"?"🔄 Continuer":"✨ Nouveau"}
@@ -524,7 +801,6 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
             <button style={S.btnRedSm} onClick={()=>setItems(it=>it.filter((_,idx)=>idx!==i))}>✕ Supprimer</button>
           </div>
 
-          {/* Sélecteur traitement ou nouveau acte */}
           {item.type==="continuer"?(
             <div style={S.fGroup}>
               <label style={S.fLabel}>Traitement à continuer</label>
@@ -561,7 +837,6 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
             </div>
           )}
 
-          {/* ══ Champs propres à CE traitement ══ */}
           <div style={S.formRow}>
             <div style={S.fGroup}>
               <label style={S.fLabel}>Étape / Séance</label>
@@ -674,13 +949,19 @@ function Modal({title,children,onClose,wide}){
 
 // ══ STYLES ══════════════════════════════════════════════════════════════════════
 const S={
-  app:{display:"flex",height:"100vh",fontFamily:"'Segoe UI',sans-serif",background:"#f1f5f9",overflow:"hidden"},
+  app:{display:"flex",height:"100vh",fontFamily:"'Segoe UI',sans-serif",background:"#f1f5f9",overflow:"hidden",flexDirection:"column"},
+  offlineBanner:{background:"#ef4444",color:"#fff",textAlign:"center",padding:"8px 16px",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:10,flexShrink:0},
+  syncBanner:{background:"#1e40af",color:"#fff",textAlign:"center",padding:"7px 16px",fontSize:12,fontWeight:500,flexShrink:0},
+  syncToast:{position:"fixed",bottom:24,right:24,background:"#16a34a",color:"#fff",padding:"10px 18px",borderRadius:10,fontSize:13,fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,.2)",zIndex:9999,animation:"fadeIn .3s ease"},
+  pendingBadge:{background:"rgba(255,255,255,.25)",padding:"2px 8px",borderRadius:12,fontSize:11},
+  innerLayout:{display:"flex",flex:1,overflow:"hidden"},
   sidebar:{width:220,background:"#0f172a",display:"flex",flexDirection:"column",padding:"20px 10px",gap:4,flexShrink:0},
   sideTop:{display:"flex",alignItems:"center",gap:10,padding:"0 8px 16px",borderBottom:"1px solid #1e293b",marginBottom:8},
   siName:{color:"#f1f5f9",fontWeight:700,fontSize:13}, siRole:{color:"#64748b",fontSize:11,marginTop:2},
   pratSel:{padding:"6px 8px",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:6,fontSize:12,outline:"none",cursor:"pointer"},
   navBtn:{display:"flex",alignItems:"center",gap:8,padding:"9px 12px",borderRadius:8,border:"none",background:"transparent",color:"#94a3b8",cursor:"pointer",fontSize:13,fontWeight:500,textAlign:"left"},
   navOn:{background:"#1e40af",color:"#fff"},
+  syncBtn:{padding:"6px 10px",background:"#0ea5e9",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:600,width:"100%",marginBottom:4},
   logoutBtn:{padding:"7px 12px",background:"transparent",border:"1px solid #334155",borderRadius:6,color:"#94a3b8",cursor:"pointer",fontSize:11,width:"100%"},
   main:{flex:1,overflow:"auto",padding:28},
   loader:{display:"flex",alignItems:"center",justifyContent:"center",height:"60vh",color:"#94a3b8",fontSize:18},
