@@ -10,7 +10,7 @@ const LOGIN_PASS   = "cabinet2026";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ─── BASE DE DONNÉES LOCALE ───────────────────────────────────────────────────
+// ─── BASE DE DONNÉES LOCALE (IndexedDB via Dexie) ─────────────────────────────
 const localDB = new Dexie("CabinetDentaire_v1");
 localDB.version(1).stores({
   patients:  "id, nom, prenom, dateCreation",
@@ -18,27 +18,49 @@ localDB.version(1).stores({
   syncQueue: "++id, tableName, action, timestamp",
 });
 
+// ─── FILE DE SYNCHRONISATION ──────────────────────────────────────────────────
 async function enqueue(tableName, action, payload) {
-  await localDB.syncQueue.add({ tableName, action, payload: JSON.stringify(payload), timestamp: Date.now() });
+  await localDB.syncQueue.add({
+    tableName,
+    action,
+    payload: JSON.stringify(payload),
+    timestamp: Date.now(),
+  });
 }
 
 async function flushQueue(onProgress) {
   const pending = await localDB.syncQueue.orderBy("timestamp").toArray();
   if (pending.length === 0) return true;
+
   let done = 0;
   onProgress && onProgress({ active: true, total: pending.length, done });
+
   for (const op of pending) {
     try {
       const payload = JSON.parse(op.payload);
-      if (op.action === "UPSERT") { const { error } = await supabase.from(op.tableName).upsert(payload); if (error) throw error; }
-      else if (op.action === "DELETE_ID") { const { error } = await supabase.from(op.tableName).delete().eq("id", payload.id); if (error) throw error; }
-      else if (op.action === "DELETE_WHERE") { const { error } = await supabase.from(op.tableName).delete().eq(payload.col, payload.val); if (error) throw error; }
-      else if (op.action === "UPDATE_WHERE") { const { error } = await supabase.from(op.tableName).update(payload.updates).eq(payload.col, payload.val); if (error) throw error; }
+
+      if (op.action === "UPSERT") {
+        const { error } = await supabase.from(op.tableName).upsert(payload);
+        if (error) throw error;
+      } else if (op.action === "DELETE_ID") {
+        const { error } = await supabase.from(op.tableName).delete().eq("id", payload.id);
+        if (error) throw error;
+      } else if (op.action === "DELETE_WHERE") {
+        const { error } = await supabase.from(op.tableName).delete().eq(payload.col, payload.val);
+        if (error) throw error;
+      } else if (op.action === "UPDATE_WHERE") {
+        const { error } = await supabase.from(op.tableName).update(payload.updates).eq(payload.col, payload.val);
+        if (error) throw error;
+      }
+
       await localDB.syncQueue.delete(op.id);
       done++;
       onProgress && onProgress({ active: true, total: pending.length, done });
-    } catch (err) { console.error(`❌ Sync error [${op.tableName}/${op.action}]:`, err); }
+    } catch (err) {
+      console.error(`❌ Sync error [${op.tableName}/${op.action}]:`, err);
+    }
   }
+
   onProgress && onProgress({ active: false, total: 0, done: 0 });
   return true;
 }
@@ -53,7 +75,9 @@ async function pullFromSupabase() {
     if (pts) { await localDB.patients.clear(); if (pts.length > 0) await localDB.patients.bulkPut(pts); }
     if (acts) { await localDB.actes.clear(); if (acts.length > 0) await localDB.actes.bulkPut(acts); }
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 // ─── UTILITAIRES ─────────────────────────────────────────────────────────────
@@ -71,10 +95,9 @@ const TYPES = Object.keys(TARIFS);
 const uid  = () => Math.random().toString(36).slice(2,11)+Date.now().toString(36);
 const now  = () => new Date().toISOString().slice(0,10);
 const fmt  = n  => Number(n||0).toLocaleString("fr-DZ")+" DA";
-// ID court lisible : ex "P-3F9A2B"
-const patCode = id => "P-" + (id||"").slice(0,6).toUpperCase();
 
 const getAllSessions = (all,ref) => all.filter(a=>(a.traitementRef||a.id)===ref);
+
 const getTreatSummary = (all,ref) => {
   const sessions = getAllSessions(all,ref);
   const sorted   = [...sessions].sort((a,b)=>(Number(a.seanceNum)||1)-(Number(b.seanceNum)||1));
@@ -98,6 +121,8 @@ export default function App() {
   const [loading,    setLoading]    = useState(true);
   const [modal,      setModal]      = useState(null);
   const [mData,      setMData]      = useState(null);
+
+  // ── Statut réseau / sync ──────────────────────────────────────────────────
   const [isOnline,   setIsOnline]   = useState(navigator.onLine);
   const [syncState,  setSyncState]  = useState({ active: false, total: 0, done: 0 });
   const [pendingCount, setPendingCount] = useState(0);
@@ -105,15 +130,22 @@ export default function App() {
   const [showSyncToast, setShowSyncToast] = useState(false);
   const syncTimerRef = useRef(null);
 
+  // ── Chargement depuis IndexedDB local (fonctionne toujours, même hors-ligne) ─
   const loadLocal = async () => {
     const [pts, acts] = await Promise.all([
       localDB.patients.orderBy("dateCreation").reverse().toArray(),
       localDB.actes.orderBy("date").reverse().toArray(),
     ]);
-    setPatients(pts); setActes(acts);
+    setPatients(pts);
+    setActes(acts);
   };
-  const refreshPendingCount = async () => { const count = await localDB.syncQueue.count(); setPendingCount(count); };
 
+  const refreshPendingCount = async () => {
+    const count = await localDB.syncQueue.count();
+    setPendingCount(count);
+  };
+
+  // ── Synchronisation complète : flush local → pull serveur ─────────────────
   const syncWithServer = async () => {
     if (!navigator.onLine) return;
     try {
@@ -125,28 +157,43 @@ export default function App() {
       setShowSyncToast(true);
       clearTimeout(syncTimerRef.current);
       syncTimerRef.current = setTimeout(() => setShowSyncToast(false), 3000);
-    } catch (err) { console.error("syncWithServer error:", err); }
+    } catch (err) {
+      console.error("syncWithServer error:", err);
+    }
   };
 
+  // ── Démarrage de l'app ────────────────────────────────────────────────────
   useEffect(() => {
     if (!loggedIn) return;
     (async () => {
       setLoading(true);
-      await loadLocal();
+      await loadLocal();          // Chargement immédiat depuis IndexedDB
       setLoading(false);
       await refreshPendingCount();
-      if (navigator.onLine) await syncWithServer();
+      if (navigator.onLine) {
+        await syncWithServer();   // Sync au démarrage si connecté
+      }
     })();
   }, [loggedIn]);
 
+  // ── Écoute des événements réseau ──────────────────────────────────────────
   useEffect(() => {
-    const handleOnline  = async () => { setIsOnline(true);  await syncWithServer(); };
-    const handleOffline = ()        => { setIsOnline(false); };
+    const handleOnline = async () => {
+      setIsOnline(true);
+      await syncWithServer();
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
     window.addEventListener("online",  handleOnline);
     window.addEventListener("offline", handleOffline);
-    return () => { window.removeEventListener("online", handleOnline); window.removeEventListener("offline", handleOffline); };
+    return () => {
+      window.removeEventListener("online",  handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
   }, []);
 
+  // ── Realtime Supabase (uniquement quand connecté) ─────────────────────────
   useEffect(() => {
     if (!loggedIn || !isOnline) return;
     const ch = supabase.channel("rt")
@@ -158,44 +205,82 @@ export default function App() {
 
   const close = () => { setModal(null); setMData(null); };
 
+  // ─── OPÉRATIONS OFFLINE-FIRST ─────────────────────────────────────────────
+
   const savePatient = async (data) => {
     await localDB.patients.put(data);
-    if (isOnline) { await supabase.from("patients").upsert(data); } else { await enqueue("patients", "UPSERT", data); }
-    await refreshPendingCount(); await loadLocal();
+    if (isOnline) {
+      await supabase.from("patients").upsert(data);
+    } else {
+      await enqueue("patients", "UPSERT", data);
+    }
+    await refreshPendingCount();
+    await loadLocal();
   };
+
   const saveActes = async (list) => {
     await localDB.actes.bulkPut(list);
-    if (isOnline) { await supabase.from("actes").upsert(list); } else { for (const a of list) await enqueue("actes", "UPSERT", a); }
-    await refreshPendingCount(); await loadLocal();
+    if (isOnline) {
+      await supabase.from("actes").upsert(list);
+    } else {
+      for (const a of list) await enqueue("actes", "UPSERT", a);
+    }
+    await refreshPendingCount();
+    await loadLocal();
   };
+
   const updateActe = async (id, data) => {
     await localDB.actes.update(id, data);
-    if (isOnline) { await supabase.from("actes").update(data).eq("id", id); }
-    else { const existing = await localDB.actes.get(id); await enqueue("actes", "UPSERT", { ...existing, ...data }); }
-    await refreshPendingCount(); await loadLocal();
+    if (isOnline) {
+      await supabase.from("actes").update(data).eq("id", id);
+    } else {
+      const existing = await localDB.actes.get(id);
+      await enqueue("actes", "UPSERT", { ...existing, ...data });
+    }
+    await refreshPendingCount();
+    await loadLocal();
   };
+
   const deletePatient = async (id) => {
     if (!confirm("Supprimer ce patient et toutes ses données ?")) return;
     await localDB.actes.where("patientId").equals(id).delete();
     await localDB.patients.delete(id);
-    if (isOnline) { await supabase.from("actes").delete().eq("patientId", id); await supabase.from("patients").delete().eq("id", id); }
-    else { await enqueue("actes", "DELETE_WHERE", { col:"patientId", val:id }); await enqueue("patients", "DELETE_ID", { id }); }
-    await refreshPendingCount(); await loadLocal();
+    if (isOnline) {
+      await supabase.from("actes").delete().eq("patientId", id);
+      await supabase.from("patients").delete().eq("id", id);
+    } else {
+      await enqueue("actes",    "DELETE_WHERE", { col: "patientId", val: id });
+      await enqueue("patients", "DELETE_ID",    { id });
+    }
+    await refreshPendingCount();
+    await loadLocal();
   };
+
   const deleteActe = async (id) => {
     if (!confirm("Supprimer cet acte ?")) return;
     await localDB.actes.delete(id);
-    if (isOnline) { await supabase.from("actes").delete().eq("id", id); } else { await enqueue("actes", "DELETE_ID", { id }); }
-    await refreshPendingCount(); await loadLocal();
-  };
-  const terminateTraitement = async (ref) => {
-    if (!confirm("Marquer ce traitement comme terminé ?")) return;
-    await localDB.actes.where("traitementRef").equals(ref).modify({ statut:"terminé" });
-    if (isOnline) { await supabase.from("actes").update({ statut:"terminé" }).eq("traitementRef", ref); }
-    else { await enqueue("actes", "UPDATE_WHERE", { col:"traitementRef", val:ref, updates:{ statut:"terminé" } }); }
-    await refreshPendingCount(); await loadLocal();
+    if (isOnline) {
+      await supabase.from("actes").delete().eq("id", id);
+    } else {
+      await enqueue("actes", "DELETE_ID", { id });
+    }
+    await refreshPendingCount();
+    await loadLocal();
   };
 
+  const terminateTraitement = async (ref) => {
+    if (!confirm("Marquer ce traitement comme terminé ?")) return;
+    await localDB.actes.where("traitementRef").equals(ref).modify({ statut: "terminé" });
+    if (isOnline) {
+      await supabase.from("actes").update({ statut: "terminé" }).eq("traitementRef", ref);
+    } else {
+      await enqueue("actes", "UPDATE_WHERE", { col: "traitementRef", val: ref, updates: { statut: "terminé" } });
+    }
+    await refreshPendingCount();
+    await loadLocal();
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
   if (!loggedIn) return (
     <LoginPage onLogin={(u,p)=>{
       if (u===LOGIN_USER && p===LOGIN_PASS) { localStorage.setItem("cab_auth","1"); setLoggedIn(true); }
@@ -217,75 +302,84 @@ export default function App() {
       {/* ── Bannière hors-ligne ── */}
       {!isOnline && (
         <div style={S.offlineBanner}>
-          📴 Mode hors-ligne — Données sauvegardées localement
+          📴 Mode hors-ligne — Vos données sont sauvegardées localement
           {pendingCount > 0 && <span style={S.pendingBadge}>{pendingCount} en attente</span>}
         </div>
       )}
-      {syncState.active && (
-        <div style={S.syncBanner}>🔄 Synchronisation… {syncState.done}/{syncState.total}</div>
-      )}
+
+      {/* ── Toast sync réussie ── */}
       {showSyncToast && (
-        <div style={S.syncToast}>✅ Synchronisé — {lastSync}</div>
+        <div style={S.syncToast}>✅ Synchronisation terminée — {lastSync}</div>
       )}
 
-      {/* ══ BARRE DE NAVIGATION HORIZONTALE EN HAUT ══ */}
-      <nav style={S.topNav}>
+      {/* ── Bannière sync en cours ── */}
+      {syncState.active && (
+        <div style={S.syncBanner}>
+          🔄 Synchronisation… {syncState.done}/{syncState.total} opération(s)
+        </div>
+      )}
 
-        {/* Logo */}
-        <div style={S.navLogo}>
-          <span style={{fontSize:22}}>🦷</span>
+      <nav style={S.sidebar}>
+        <div style={S.sideTop}>
+          <span style={{fontSize:26}}>🦷</span>
           <div>
-            <div style={S.navTitle}>Cabinet Dentaire</div>
+            <div style={S.siName}>Cabinet Dentaire</div>
+            <div style={S.siRole}>{praticien}</div>
           </div>
         </div>
 
-        {/* Boutons de navigation */}
-        <div style={S.navLinks}>
+        <select style={S.pratSel} value={praticien} onChange={e=>{setPraticien(e.target.value);localStorage.setItem("cab_prat",e.target.value);}}>
+          <option>Dr. Amin</option>
+          <option>Dr. Bossioda</option>
+        </select>
+
+        <div style={{flex:1,display:"flex",flexDirection:"column",gap:4,marginTop:8}}>
           {nav.map(n=>(
-            <button key={n.id} style={{...S.navLink,...(page===n.id?S.navLinkOn:{})}} onClick={()=>setPage(n.id)}>
+            <button key={n.id} style={{...S.navBtn,...(page===n.id?S.navOn:{})}} onClick={()=>setPage(n.id)}>
               {n.icon} {n.label}
             </button>
           ))}
         </div>
 
-        {/* Droite : praticien + statut + sync + logout */}
-        <div style={S.navRight}>
-          <select style={S.pratSel} value={praticien} onChange={e=>{setPraticien(e.target.value);localStorage.setItem("cab_prat",e.target.value);}}>
-            <option>Dr. Amin</option>
-            <option>Dr. Bossioda</option>
-          </select>
-
+        <div>
           {/* Statut réseau */}
-          <div style={S.statusChip}>
-            <span style={{
-              width:7,height:7,borderRadius:"50%",flexShrink:0,
-              background:isOnline?"#22c55e":"#ef4444",
-              boxShadow:isOnline?"0 0 5px #22c55e":"0 0 5px #ef4444",
-            }}/>
-            <span style={{color:isOnline?"#22c55e":"#ef4444",fontSize:11,fontWeight:600}}>
-              {isOnline?"En ligne":"Hors-ligne"}
-            </span>
-            {pendingCount > 0 && (
-              <span style={{background:"#f59e0b",color:"#fff",borderRadius:10,padding:"0 6px",fontSize:10,fontWeight:700}}>
-                {pendingCount}
+          <div style={{fontSize:11,padding:"8px 8px 4px",borderTop:"1px solid #1e293b",marginBottom:4}}>
+            <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:3}}>
+              <span style={{
+                width:8,height:8,borderRadius:"50%",flexShrink:0,
+                background:isOnline?"#22c55e":"#ef4444",
+                boxShadow:isOnline?"0 0 6px #22c55e":"0 0 6px #ef4444",
+              }}/>
+              <span style={{color:isOnline?"#22c55e":"#ef4444",fontWeight:600}}>
+                {isOnline ? "En ligne" : "Hors-ligne"}
               </span>
+            </div>
+            {pendingCount > 0 && (
+              <div style={{color:"#f59e0b",fontSize:10,paddingLeft:13}}>
+                ⏳ {pendingCount} op. en attente
+              </div>
+            )}
+            {lastSync && isOnline && (
+              <div style={{color:"#475569",fontSize:10,paddingLeft:13}}>
+                Sync: {lastSync}
+              </div>
             )}
           </div>
 
+          {/* Bouton sync manuel */}
           {isOnline && (
             <button style={S.syncBtn} onClick={syncWithServer} disabled={syncState.active}>
-              {syncState.active ? "⏳" : "🔄"}
+              {syncState.active ? "⏳ Sync…" : "🔄 Synchroniser"}
             </button>
           )}
 
-          <button style={S.logoutBtn} onClick={logout}>🔒</button>
+          <button style={S.logoutBtn} onClick={logout}>🔒 Déconnexion</button>
         </div>
       </nav>
 
-      {/* ══ CONTENU PRINCIPAL ══ */}
       <main style={S.main}>
         {loading ? <div style={S.loader}>⏳ Chargement…</div> : <>
-          {page==="dashboard" && <div style={{flex:1,overflow:"auto",padding:"12px 16px"}}><Dashboard patients={patients} actes={actes}/></div>}
+          {page==="dashboard" && <Dashboard patients={patients} actes={actes}/>}
           {page==="patients"  && (
             <PatientsPage patients={patients} actes={actes}
               onNew={()=>setModal("newPat")}
@@ -296,39 +390,52 @@ export default function App() {
             />
           )}
           {page==="actes" && (
-            <div style={{flex:1,overflow:"auto",padding:"12px 16px"}}>
-              <ActesPage patients={patients} actes={actes}
-                onNew={()=>setModal("newActe")}
-                onDelete={deleteActe}
-                onEdit={a=>{setModal("editActe");setMData(a);}}
-                onTerminate={terminateTraitement}
-              />
-            </div>
+            <ActesPage patients={patients} actes={actes}
+              onNew={()=>setModal("newActe")}
+              onDelete={deleteActe}
+              onEdit={a=>{setModal("editActe");setMData(a);}}
+              onTerminate={terminateTraitement}
+            />
           )}
         </>}
       </main>
 
       {modal==="newPat" && (
         <PatientModal onClose={close} onSave={async d=>{
-          const exists = patients.find(p=>p.nom.toLowerCase()===d.nom.toLowerCase()&&p.prenom.toLowerCase()===d.prenom.toLowerCase());
+          const exists = patients.find(p=>
+            p.nom.toLowerCase()===d.nom.toLowerCase() &&
+            p.prenom.toLowerCase()===d.prenom.toLowerCase()
+          );
           if (exists) { alert("⚠️ Ce patient existe déjà : "+d.prenom+" "+d.nom); return; }
-          await savePatient({ ...d, id:uid(), dateCreation:now() }); close();
+          const newPat = { ...d, id: uid(), dateCreation: now() };
+          await savePatient(newPat);
+          close();
         }}/>
       )}
+
       {modal==="editPat" && mData && (
-        <PatientModal patient={mData} onClose={close} onSave={async d=>{ await savePatient({ ...mData, ...d }); close(); }}/>
+        <PatientModal patient={mData} onClose={close} onSave={async d=>{
+          await savePatient({ ...mData, ...d });
+          close();
+        }}/>
       )}
+
       {modal==="newActe" && (
         <ActeModal patients={patients} actes={actes} praticien={praticien} onClose={close}
-          onSave={async list=>{ await saveActes(list); close(); }}/>
+          onSave={async list=>{ await saveActes(list); close(); }}
+        />
       )}
+
       {modal==="editActe" && mData && (
         <EditActeModal acte={mData} onClose={close}
-          onSave={async d=>{ await updateActe(mData.id, d); close(); }}/>
+          onSave={async d=>{ await updateActe(mData.id, d); close(); }}
+        />
       )}
+
       {modal==="editVers" && mData && (
         <EditVersementModal acte={mData} onClose={close}
-          onSave={async v=>{ await updateActe(mData.id, { montantVerse:v }); close(); }}/>
+          onSave={async v=>{ await updateActe(mData.id, { montantVerse: v }); close(); }}
+        />
       )}
     </div>
   );
@@ -371,10 +478,10 @@ function Dashboard({patients,actes}){
       <h1 style={S.pageTitle}>Tableau de bord</h1>
       <div style={S.statsGrid}>
         {[
-          {l:"Total Patients",    v:patients.length,                    icon:"👥",c:"#3b82f6"},
-          {l:"Actes aujourd'hui", v:actes.filter(a=>a.date===d).length, icon:"🦷",c:"#10b981"},
-          {l:"Recettes du jour",  v:fmt(caAuj),                         icon:"💵",c:"#f59e0b"},
-          {l:"Total Impayés",     v:fmt(totalReste),                    icon:"⚠️",c:"#ef4444"},
+          {l:"Total Patients",    v:patients.length,                             icon:"👥",c:"#3b82f6"},
+          {l:"Actes aujourd'hui", v:actes.filter(a=>a.date===d).length,          icon:"🦷",c:"#10b981"},
+          {l:"Recettes du jour",  v:fmt(caAuj),                                  icon:"💵",c:"#f59e0b"},
+          {l:"Total Impayés",     v:fmt(totalReste),                             icon:"⚠️",c:"#ef4444"},
         ].map(x=>(
           <div key={x.l} style={{...S.statCard,borderLeftColor:x.c}}>
             <span style={{fontSize:28}}>{x.icon}</span>
@@ -388,47 +495,32 @@ function Dashboard({patients,actes}){
 
 // ══ PATIENTS ═══════════════════════════════════════════════════════════════════
 function PatientsPage({patients,actes,onNew,onEdit,onDelete,onEditVersement,onTerminate}){
-  const [search,setSearch]=useState("");
-  const [selId,setSelId]=useState(null);
-  const list=patients.filter(p=>{
-    const q=search.toLowerCase();
-    return `${p.nom||""} ${p.prenom||""} ${p.telephone||""} ${patCode(p.id)}`.toLowerCase().includes(q);
-  });
+  const [search,setSearch]=useState(""); const [selId,setSelId]=useState(null);
+  const list=patients.filter(p=>`${p.nom||""} ${p.prenom||""} ${p.telephone||""} ${p.dateNaissance||""}`.toLowerCase().includes(search.toLowerCase()));
   const sel=patients.find(p=>p.id===selId);
   return(
     <div style={S.splitView}>
       <div style={S.leftPane}>
         <div style={S.paneHdr}>
-          <h2 style={{margin:0,fontSize:14,fontWeight:700,color:"#0f172a"}}>Patients ({patients.length})</h2>
+          <h2 style={{...S.pageTitle,margin:0,fontSize:15}}>Patients ({patients.length})</h2>
           <button style={S.btnBlue} onClick={onNew}>+ Nouveau</button>
         </div>
-        <input style={S.searchBox} placeholder="🔍 Nom, prénom, ID…" value={search} onChange={e=>setSearch(e.target.value)}/>
+        <input style={S.searchBox} placeholder="🔍 Rechercher…" value={search} onChange={e=>setSearch(e.target.value)}/>
         <div style={S.scrollList}>
           {list.map(p=>(
             <div key={p.id} style={{...S.patRow,...(selId===p.id?S.patRowOn:{})}} onClick={()=>setSelId(p.id)}>
               <div style={S.avatar}>{p.prenom?.[0]||"?"}{p.nom?.[0]||""}</div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={S.patName}>{p.prenom} {p.nom}</div>
-                <div style={{display:"flex",alignItems:"center",gap:5,marginTop:2}}>
-                  <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:8,fontFamily:"monospace",letterSpacing:0.5}}>
-                    {patCode(p.id)}
-                  </span>
-                  <span style={S.patSub}>{p.telephone||"—"}</span>
-                </div>
-              </div>
+              <div><div style={S.patName}>{p.prenom} {p.nom}</div><div style={S.patSub}>{p.telephone||"Pas de téléphone"}{p.dateNaissance?" · "+p.dateNaissance:""}</div></div>
             </div>
           ))}
           {list.length===0&&<div style={S.empty}>Aucun patient</div>}
         </div>
       </div>
       <div style={S.rightPane}>
-        {sel
-          ? <PatientFiche patient={sel} actes={actes.filter(a=>a.patientId===sel.id)} allActes={actes}
-              onEdit={()=>onEdit(sel)} onDelete={()=>{onDelete(sel.id);setSelId(null);}}
-              onEditVersement={onEditVersement} onTerminate={onTerminate}
-            />
-          : <div style={S.emptyDetail}>← Sélectionnez un patient</div>
-        }
+        {sel?<PatientFiche patient={sel} actes={actes.filter(a=>a.patientId===sel.id)} allActes={actes}
+          onEdit={()=>onEdit(sel)} onDelete={()=>{onDelete(sel.id);setSelId(null);}}
+          onEditVersement={onEditVersement} onTerminate={onTerminate}
+        />:<div style={S.emptyDetail}>← Sélectionnez un patient</div>}
       </div>
     </div>
   );
@@ -441,16 +533,12 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
   let totalPlan=0,totalPaye=0;
   refs.forEach(ref=>{ const {netPrice,totalVerse}=getTreatSummary(allActes,ref); totalPlan+=netPrice; totalPaye+=totalVerse; });
   const totalReste=Math.max(0,totalPlan-totalPaye);
+
   return(
     <div style={S.ficheWrap}>
       <div style={S.ficheHead}>
         <div>
-          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
-            <h2 style={S.ficheTitle}>{patient.prenom} {patient.nom}</h2>
-            <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:10,fontFamily:"monospace",letterSpacing:0.5,flexShrink:0}}>
-              {patCode(patient.id)}
-            </span>
-          </div>
+          <h2 style={S.ficheTitle}>{patient.prenom} {patient.nom}</h2>
           <div style={{color:"#64748b",fontSize:12}}>{patient.dateCreation?`Depuis ${patient.dateCreation}`:""}</div>
         </div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -458,12 +546,14 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
           <button style={S.btnRed}  onClick={onDelete}>🗑️ Supprimer</button>
         </div>
       </div>
+
       <div style={S.infoGrid}>
         {[["📞 Téléphone",patient.telephone||"—"],["🎂 Naissance",patient.dateNaissance||"—"],["⚠️ Allergies",patient.allergies||"—"],
           ["🩺 Antécédents",patient.antecedents||"—"],["💊 Traitements",patient.traitements||"—"]].map(([k,v])=>(
           <div key={k} style={S.infoBox}><div style={S.infoKey}>{k}</div><div style={S.infoVal}>{v}</div></div>
         ))}
       </div>
+
       {refs.length>0&&(
         <div style={S.finSummary}>
           <div style={S.finItem}><span>💰 Total des soins</span><b style={{color:"#1e40af"}}>{fmt(totalPlan)}</b></div>
@@ -471,6 +561,7 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
           <div style={{...S.finItem,borderBottom:"none"}}><span>⚠️ Reste à payer</span><b style={{color:totalReste>0?"#ef4444":"#16a34a"}}>{fmt(totalReste)}</b></div>
         </div>
       )}
+
       <h3 style={S.secTitle}>🦷 Historique des traitements</h3>
       {refs.length===0&&<div style={S.empty}>Aucun acte enregistré</div>}
       {refs.map(ref=>{
@@ -507,7 +598,9 @@ function PatientFiche({patient,actes,allActes,onEdit,onDelete,onEditVersement,on
                       <td style={{...S.td,color:"#7c3aed"}}>{s.diagnostic||"—"}</td>
                       <td style={{...S.td,color:"#6b7280",fontSize:11}}>{s.observations||"—"}</td>
                       <td style={{...S.td,color:"#16a34a",fontWeight:600}}>+{fmt(s.montantVerse||0)}</td>
-                      <td style={S.td}><button style={S.btnEditSm} onClick={()=>onEditVersement(s)} title="Modifier versement">💳</button></td>
+                      <td style={S.td}>
+                        <button style={S.btnEditSm} onClick={()=>onEditVersement(s)} title="Modifier versement">💳</button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -553,32 +646,24 @@ function PatientModal({patient,onClose,onSave}){
   );
 }
 
-
 // ══ ACTES PAGE ══════════════════════════════════════════════════════════════════
 function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
-  const [search,setSearch]=useState("");
-  const q=search.toLowerCase().trim();
-  // Filtrer par nom, prénom ou ID patient
-  const matchedPatIds = q
-    ? new Set(patients.filter(p=>`${p.prenom||""} ${p.nom||""} ${patCode(p.id)}`.toLowerCase().includes(q)).map(p=>p.id))
-    : null;
-  const filtered=actes.filter(a=>!matchedPatIds||matchedPatIds.has(a.patientId));
+  const [filterPat,setFilterPat]=useState("");
+  const filtered=actes.filter(a=>!filterPat||a.patientId===filterPat);
   const groups={};
   filtered.forEach(a=>{const k=a.traitementRef||a.id;if(!groups[k])groups[k]=[];groups[k].push(a);});
+
   return(
     <div>
       <div style={S.pageHdr}>
         <h1 style={S.pageTitle}>Actes Cliniques</h1>
         <button style={S.btnBlue} onClick={onNew}>+ Nouvelle Séance</button>
       </div>
-      {/* Barre de recherche */}
-      <input
-        style={{...S.searchBox,margin:"0 0 12px",width:"100%",maxWidth:380,boxSizing:"border-box",fontSize:13}}
-        placeholder="🔍 Rechercher par nom, prénom ou ID (ex: P-3F9A2B)…"
-        value={search}
-        onChange={e=>setSearch(e.target.value)}
-      />
-      {Object.keys(groups).length===0&&<div style={S.empty}>{q?"Aucun résultat pour « "+search+" »":"Aucun acte enregistré"}</div>}
+      <select style={S.filterSel} value={filterPat} onChange={e=>setFilterPat(e.target.value)}>
+        <option value="">Tous les patients</option>
+        {patients.map(p=><option key={p.id} value={p.id}>{p.prenom} {p.nom}</option>)}
+      </select>
+      {Object.keys(groups).length===0&&<div style={S.empty}>Aucun acte enregistré</div>}
       {Object.entries(groups).map(([ref])=>{
         const {sorted,prixTotal,totalRemise,netPrice,totalVerse,reste,termine}=getTreatSummary(actes,ref);
         const first=sorted[0];
@@ -589,11 +674,6 @@ function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
               <div>
                 <div style={{fontWeight:700,fontSize:14,display:"flex",alignItems:"center",gap:6}}>
                   {patient?`${patient.prenom} ${patient.nom}`:"—"}
-                  {patient&&(
-                    <span style={{background:"#e0e7ff",color:"#3730a3",fontSize:10,fontWeight:700,padding:"1px 6px",borderRadius:8,fontFamily:"monospace"}}>
-                      {patCode(patient.id)}
-                    </span>
-                  )}
                   {termine&&<span style={S.pill("#f1f5f9","#64748b")}>Terminé</span>}
                 </div>
                 <div style={{fontSize:12,color:"#64748b"}}>{first.typeActe}{first.dents?` — Dent ${first.dents}`:""}{(first.quantite||1)>1?` × ${first.quantite}`:""}</div>
@@ -625,22 +705,28 @@ function ActesPage({patients,actes,onNew,onDelete,onEdit,onTerminate}){
 
 // ══ MODAL NOUVELLE SÉANCE ══════════════════════════════════════════════════════
 function ActeModal({patients,actes,praticien,onClose,onSave}){
-  const [patientId,setPatientId]=useState(""); const [date,setDate]=useState(now()); const [items,setItems]=useState([]);
-  const patActes=actes.filter(a=>a.patientId===patientId);
+  const [patientId, setPatientId] = useState("");
+  const [date,      setDate]      = useState(now());
+  const [items,     setItems]     = useState([]);
+
+  const patActes = actes.filter(a=>a.patientId===patientId);
   const openGroups={};
   patActes.forEach(a=>{const k=a.traitementRef||a.id;if(!openGroups[k])openGroups[k]=[];openGroups[k].push(a);});
   const openList=Object.entries(openGroups).filter(([ref])=>{
     const sessions=getAllSessions(actes,ref);
     return sessions.some(s=>!s.statut||s.statut==="en_cours");
   });
-  const newItem=(type)=>type==="continuer"
-    ?{type:"continuer",ref:"",etape:"",diagnostic:"",observations:"",versement:"",remise:0}
-    :{type:"nouveau",typeActe:"Soin",dents:"",quantite:1,prixUnitaire:5000,etape:"",diagnostic:"",observations:"",versement:"",remise:0};
+
+  const newItem = (type) => type==="continuer"
+    ? {type:"continuer", ref:"", etape:"", diagnostic:"", observations:"", versement:"", remise:0}
+    : {type:"nouveau", typeActe:"Soin", dents:"", quantite:1, prixUnitaire:5000, etape:"", diagnostic:"", observations:"", versement:"", remise:0};
+
   const updateItem=(i,k,v)=>{
     const ni=[...items]; ni[i]={...ni[i],[k]:v};
     if(k==="typeActe") ni[i].prixUnitaire=TARIFS[v]?.[0]||0;
     setItems(ni);
   };
+
   const handleSave=()=>{
     if(!patientId) return alert("Sélectionnez un patient");
     if(items.length===0) return alert("Ajoutez au moins un traitement");
@@ -650,15 +736,35 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
         if(!item.ref) return;
         const {first,sorted,prixTotal}=getTreatSummary(actes,item.ref);
         const existFact=sorted.find(s=>s.facturId)?.facturId||null;
-        list.push({id:uid(),patientId,date,praticien,typeActe:first.typeActe,dents:first.dents,quantite:first.quantite||1,prixUnitaire:Number(first.prixUnitaire||first.prix)||0,prix:prixTotal,prixTotal,remise:Number(item.remise)||0,traitementRef:item.ref,seanceNum:sorted.length+1,etape:item.etape,diagnostic:item.diagnostic,observations:item.observations,montantVerse:Number(item.versement)||0,facturId:existFact,statut:"en_cours"});
+        list.push({
+          id:uid(), patientId, date, praticien,
+          typeActe:first.typeActe, dents:first.dents, quantite:first.quantite||1,
+          prixUnitaire:Number(first.prixUnitaire||first.prix)||0,
+          prix:prixTotal, prixTotal,
+          remise:Number(item.remise)||0,
+          traitementRef:item.ref, seanceNum:sorted.length+1,
+          etape:item.etape, diagnostic:item.diagnostic, observations:item.observations,
+          montantVerse:Number(item.versement)||0,
+          facturId:existFact, statut:"en_cours",
+        });
       } else {
         const planTotal=item.quantite*item.prixUnitaire;
-        list.push({id:uid(),patientId,date,praticien,typeActe:item.typeActe,dents:item.dents,quantite:item.quantite,prixUnitaire:item.prixUnitaire,prix:planTotal,prixTotal:planTotal,remise:Number(item.remise)||0,traitementRef:uid(),seanceNum:1,etape:item.etape,diagnostic:item.diagnostic,observations:item.observations,montantVerse:Number(item.versement)||0,statut:"en_cours"});
+        list.push({
+          id:uid(), patientId, date, praticien,
+          typeActe:item.typeActe, dents:item.dents, quantite:item.quantite,
+          prixUnitaire:item.prixUnitaire, prix:planTotal, prixTotal:planTotal,
+          remise:Number(item.remise)||0,
+          traitementRef:uid(), seanceNum:1,
+          etape:item.etape, diagnostic:item.diagnostic, observations:item.observations,
+          montantVerse:Number(item.versement)||0,
+          statut:"en_cours",
+        });
       }
     });
     if(list.length===0) return alert("Sélectionnez les traitements");
     onSave(list);
   };
+
   return(
     <Modal title="Nouvelle Séance Clinique" onClose={onClose} wide>
       <div style={S.formRow}>
@@ -672,53 +778,92 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
           <input style={S.fInput} type="date" value={date} onChange={e=>setDate(e.target.value)}/>
         </div>
       </div>
+
       {patientId&&(
         <div style={S.modeRow}>
-          {openList.length>0&&(<button style={S.modeBtn} onClick={()=>setItems(it=>[...it,newItem("continuer")])}>🔄 Continuer un traitement</button>)}
-          <button style={{...S.modeBtn,...S.modeBtnOn}} onClick={()=>setItems(it=>[...it,newItem("nouveau")])}>✨ Nouveau traitement</button>
+          {openList.length>0&&(
+            <button style={S.modeBtn} onClick={()=>setItems(it=>[...it,newItem("continuer")])}>
+              🔄 Continuer un traitement
+            </button>
+          )}
+          <button style={{...S.modeBtn,...S.modeBtnOn}} onClick={()=>setItems(it=>[...it,newItem("nouveau")])}>
+            ✨ Nouveau traitement
+          </button>
         </div>
       )}
+
       {items.map((item,i)=>(
         <div key={i} style={S.itemCard}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-            <span style={item.type==="continuer"?S.pill("#dbeafe","#1e40af"):S.pill("#ede9fe","#6d28d9")}>{item.type==="continuer"?"🔄 Continuer":"✨ Nouveau"}</span>
+            <span style={item.type==="continuer"?S.pill("#dbeafe","#1e40af"):S.pill("#ede9fe","#6d28d9")}>
+              {item.type==="continuer"?"🔄 Continuer":"✨ Nouveau"}
+            </span>
             <button style={S.btnRedSm} onClick={()=>setItems(it=>it.filter((_,idx)=>idx!==i))}>✕ Supprimer</button>
           </div>
+
           {item.type==="continuer"?(
             <div style={S.fGroup}>
               <label style={S.fLabel}>Traitement à continuer</label>
               <select style={S.fInput} value={item.ref} onChange={e=>updateItem(i,"ref",e.target.value)}>
                 <option value="">— Choisir —</option>
-                {openList.map(([ref])=>{const {first,sorted,reste}=getTreatSummary(actes,ref);return <option key={ref} value={ref}>{first.typeActe}{first.dents?` Dent ${first.dents}`:""} — Séance {sorted.length+1} — Reste: {fmt(reste)}</option>;})}
+                {openList.map(([ref])=>{
+                  const {first,sorted,reste}=getTreatSummary(actes,ref);
+                  return <option key={ref} value={ref}>{first.typeActe}{first.dents?` Dent ${first.dents}`:""} — Séance {sorted.length+1} — Reste: {fmt(reste)}</option>;
+                })}
               </select>
-              {item.ref&&(()=>{const {prixTotal,totalVerse,reste}=getTreatSummary(actes,item.ref);return <div style={{...S.infoChip,marginTop:6}}>Plan: <b>{fmt(prixTotal)}</b> | Payé: <b style={{color:"#16a34a"}}>{fmt(totalVerse)}</b> | <b style={{color:"#ef4444"}}>Reste: {fmt(reste)}</b></div>;})()}
+              {item.ref&&(()=>{
+                const {prixTotal,totalVerse,reste}=getTreatSummary(actes,item.ref);
+                return <div style={{...S.infoChip,marginTop:6}}>Plan: <b>{fmt(prixTotal)}</b> | Payé: <b style={{color:"#16a34a"}}>{fmt(totalVerse)}</b> | <b style={{color:"#ef4444"}}>Reste: {fmt(reste)}</b></div>;
+              })()}
             </div>
           ):(
             <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:8}}>
-              <select style={{...S.fInput,flex:2,minWidth:120}} value={item.typeActe} onChange={e=>updateItem(i,"typeActe",e.target.value)}>{TYPES.map(t=><option key={t}>{t}</option>)}</select>
+              <select style={{...S.fInput,flex:2,minWidth:120}} value={item.typeActe} onChange={e=>updateItem(i,"typeActe",e.target.value)}>
+                {TYPES.map(t=><option key={t}>{t}</option>)}
+              </select>
               <input style={{...S.fInput,width:75}} placeholder="Dent(s)" value={item.dents} onChange={e=>updateItem(i,"dents",e.target.value)}/>
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:1}}>
                 <span style={{fontSize:10,color:"#94a3b8"}}>Qté</span>
                 <input style={{...S.fInput,width:50,textAlign:"center"}} type="number" min={1} value={item.quantite} onChange={e=>updateItem(i,"quantite",Math.max(1,parseInt(e.target.value)||1))}/>
               </div>
-              {TARIFS[item.typeActe]?.length>1
-                ?<select style={{...S.fInput,width:115}} value={item.prixUnitaire} onChange={e=>updateItem(i,"prixUnitaire",Number(e.target.value))}>{TARIFS[item.typeActe].map(p=><option key={p} value={p}>{fmt(p)}</option>)}</select>
-                :<input style={{...S.fInput,width:115}} type="number" value={item.prixUnitaire} onChange={e=>updateItem(i,"prixUnitaire",Number(e.target.value))}/>
-              }
+              {TARIFS[item.typeActe]?.length>1?(
+                <select style={{...S.fInput,width:115}} value={item.prixUnitaire} onChange={e=>updateItem(i,"prixUnitaire",Number(e.target.value))}>
+                  {TARIFS[item.typeActe].map(p=><option key={p} value={p}>{fmt(p)}</option>)}
+                </select>
+              ):(
+                <input style={{...S.fInput,width:115}} type="number" value={item.prixUnitaire} onChange={e=>updateItem(i,"prixUnitaire",Number(e.target.value))}/>
+              )}
               <div style={{fontWeight:700,color:"#1e40af",fontSize:13,whiteSpace:"nowrap"}}>{fmt(item.quantite*item.prixUnitaire)}</div>
             </div>
           )}
+
           <div style={S.formRow}>
-            <div style={S.fGroup}><label style={S.fLabel}>Étape / Séance</label><input style={S.fInput} value={item.etape} onChange={e=>updateItem(i,"etape",e.target.value)} placeholder="ex: Préparation…"/></div>
-            <div style={S.fGroup}><label style={S.fLabel}>🔬 Diagnostic</label><input style={S.fInput} value={item.diagnostic} onChange={e=>updateItem(i,"diagnostic",e.target.value)} placeholder="ex: Pulpite…"/></div>
+            <div style={S.fGroup}>
+              <label style={S.fLabel}>Étape / Séance</label>
+              <input style={S.fInput} value={item.etape} onChange={e=>updateItem(i,"etape",e.target.value)} placeholder="ex: Préparation, Obturation…"/>
+            </div>
+            <div style={S.fGroup}>
+              <label style={S.fLabel}>🔬 Diagnostic</label>
+              <input style={S.fInput} value={item.diagnostic} onChange={e=>updateItem(i,"diagnostic",e.target.value)} placeholder="ex: Pulpite, Abcès…"/>
+            </div>
           </div>
-          <div style={S.fGroup}><label style={S.fLabel}>Observations</label><textarea style={S.fTextarea} rows={2} value={item.observations} onChange={e=>updateItem(i,"observations",e.target.value)}/></div>
+          <div style={S.fGroup}>
+            <label style={S.fLabel}>Observations</label>
+            <textarea style={S.fTextarea} rows={2} value={item.observations} onChange={e=>updateItem(i,"observations",e.target.value)}/>
+          </div>
           <div style={S.formRow}>
-            <div style={S.fGroup}><label style={S.fLabel}>💳 Versement (DA)</label><input style={S.fInput} type="number" min={0} value={item.versement} onChange={e=>updateItem(i,"versement",e.target.value)} placeholder="0"/></div>
-            <div style={S.fGroup}><label style={S.fLabel}>🏷️ Remise (DA)</label><input style={S.fInput} type="number" min={0} value={item.remise} onChange={e=>updateItem(i,"remise",Number(e.target.value))} placeholder="0"/></div>
+            <div style={S.fGroup}>
+              <label style={S.fLabel}>💳 Versement (DA)</label>
+              <input style={S.fInput} type="number" min={0} value={item.versement} onChange={e=>updateItem(i,"versement",e.target.value)} placeholder="0"/>
+            </div>
+            <div style={S.fGroup}>
+              <label style={S.fLabel}>🏷️ Remise (DA)</label>
+              <input style={S.fInput} type="number" min={0} value={item.remise} onChange={e=>updateItem(i,"remise",Number(e.target.value))} placeholder="0"/>
+            </div>
           </div>
         </div>
       ))}
+
       <div style={S.mAct}>
         <button style={S.btnGray} onClick={onClose}>Annuler</button>
         <button style={S.btnBlue} onClick={handleSave}>💾 Enregistrer la séance</button>
@@ -729,12 +874,21 @@ function ActeModal({patients,actes,praticien,onClose,onSave}){
 
 // ══ EDIT ACTE ══════════════════════════════════════════════════════════════════
 function EditActeModal({acte,onClose,onSave}){
-  const [f,setF]=useState({typeActe:acte.typeActe||"Soin",dents:acte.dents||"",quantite:acte.quantite||1,prixTotal:acte.prixTotal||acte.prix||0,remise:acte.remise||0,etape:acte.etape||"",diagnostic:acte.diagnostic||"",observations:acte.observations||"",montantVerse:acte.montantVerse||0,date:acte.date||now()});
+  const [f,setF]=useState({
+    typeActe:acte.typeActe||"Soin", dents:acte.dents||"", quantite:acte.quantite||1,
+    prixTotal:acte.prixTotal||acte.prix||0, remise:acte.remise||0,
+    etape:acte.etape||"", diagnostic:acte.diagnostic||"",
+    observations:acte.observations||"", montantVerse:acte.montantVerse||0, date:acte.date||now(),
+  });
   const set=(k,v)=>setF(p=>({...p,[k]:v}));
   return(
     <Modal title="Modifier la séance" onClose={onClose}>
       <div style={S.formRow}>
-        <div style={S.fGroup}><label style={S.fLabel}>Type d'acte</label><select style={S.fInput} value={f.typeActe} onChange={e=>set("typeActe",e.target.value)}>{TYPES.map(t=><option key={t}>{t}</option>)}</select></div>
+        <div style={S.fGroup}><label style={S.fLabel}>Type d'acte</label>
+          <select style={S.fInput} value={f.typeActe} onChange={e=>set("typeActe",e.target.value)}>
+            {TYPES.map(t=><option key={t}>{t}</option>)}
+          </select>
+        </div>
         <div style={S.fGroup}><label style={S.fLabel}>Date</label><input style={S.fInput} type="date" value={f.date} onChange={e=>set("date",e.target.value)}/></div>
       </div>
       <div style={S.formRow}>
@@ -763,7 +917,9 @@ function EditVersementModal({acte,onClose,onSave}){
   const [v,setV]=useState(acte.montantVerse||0);
   return(
     <Modal title="Modifier le versement" onClose={onClose}>
-      <div style={{...S.infoChip,marginBottom:16}}>S{acte.seanceNum||"?"} — {acte.date} — {acte.typeActe} {acte.dents?`Dent ${acte.dents}`:""}</div>
+      <div style={{...S.infoChip,marginBottom:16}}>
+        S{acte.seanceNum||"?"} — {acte.date} — {acte.typeActe} {acte.dents?`Dent ${acte.dents}`:""}
+      </div>
       <div style={S.fGroup}>
         <label style={S.fLabel}>💳 Montant versé (DA)</label>
         <input style={{...S.fInput,fontSize:20,fontWeight:800,textAlign:"center",padding:"14px"}} type="number" min={0} value={v} onChange={e=>setV(Number(e.target.value))}/>
@@ -792,117 +948,83 @@ function Modal({title,children,onClose,wide}){
 }
 
 // ══ STYLES ══════════════════════════════════════════════════════════════════════
-const NAV_H = 56; // hauteur barre nav en px (~1.5cm)
-
 const S={
-  // ── Layout global ──
-  app:{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'Segoe UI',sans-serif",background:"#f1f5f9",overflow:"hidden"},
-
-  // ── Barre de navigation horizontale ──
-  topNav:{
-    height:NAV_H, minHeight:NAV_H, maxHeight:NAV_H,
-    background:"#0f172a",
-    display:"flex", alignItems:"center",
-    padding:"0 16px", gap:12,
-    flexShrink:0,
-    borderBottom:"1px solid #1e293b",
-    zIndex:100,
-  },
-  navLogo:{display:"flex",alignItems:"center",gap:8,flexShrink:0,marginRight:8},
-  navTitle:{color:"#f1f5f9",fontWeight:700,fontSize:13,whiteSpace:"nowrap"},
-  navLinks:{display:"flex",alignItems:"center",gap:2,flex:1},
-  navLink:{display:"flex",alignItems:"center",gap:5,padding:"6px 12px",borderRadius:7,border:"none",background:"transparent",color:"#94a3b8",cursor:"pointer",fontSize:12,fontWeight:500,whiteSpace:"nowrap",height:36},
-  navLinkOn:{background:"#1e40af",color:"#fff"},
-  navRight:{display:"flex",alignItems:"center",gap:8,flexShrink:0,marginLeft:"auto"},
-  pratSel:{padding:"4px 8px",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:6,fontSize:12,outline:"none",cursor:"pointer",height:30},
-  statusChip:{display:"flex",alignItems:"center",gap:4,padding:"3px 8px",background:"#1e293b",borderRadius:20,height:26},
-  syncBtn:{padding:"4px 10px",background:"#0ea5e9",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:600,height:28},
-  logoutBtn:{padding:"4px 10px",background:"transparent",border:"1px solid #334155",borderRadius:6,color:"#94a3b8",cursor:"pointer",fontSize:11,height:28,whiteSpace:"nowrap"},
-
-  // ── Bannières ──
-  offlineBanner:{background:"#ef4444",color:"#fff",textAlign:"center",padding:"5px 16px",fontSize:12,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:10,flexShrink:0},
-  syncBanner:{background:"#1e40af",color:"#fff",textAlign:"center",padding:"4px 16px",fontSize:11,flexShrink:0},
-  syncToast:{position:"fixed",bottom:20,right:20,background:"#16a34a",color:"#fff",padding:"8px 16px",borderRadius:8,fontSize:12,fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,.2)",zIndex:9999},
-  pendingBadge:{background:"rgba(255,255,255,.25)",padding:"1px 7px",borderRadius:10,fontSize:11},
-
-  // ── Contenu principal ──
-  main:{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"},
-  loader:{display:"flex",alignItems:"center",justifyContent:"center",flex:1,color:"#94a3b8",fontSize:18},
-
-  // ── Login ──
+  app:{display:"flex",height:"100vh",fontFamily:"'Segoe UI',sans-serif",background:"#f1f5f9",overflow:"hidden",flexDirection:"column"},
+  offlineBanner:{background:"#ef4444",color:"#fff",textAlign:"center",padding:"8px 16px",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",gap:10,flexShrink:0},
+  syncBanner:{background:"#1e40af",color:"#fff",textAlign:"center",padding:"7px 16px",fontSize:12,fontWeight:500,flexShrink:0},
+  syncToast:{position:"fixed",bottom:24,right:24,background:"#16a34a",color:"#fff",padding:"10px 18px",borderRadius:10,fontSize:13,fontWeight:600,boxShadow:"0 4px 20px rgba(0,0,0,.2)",zIndex:9999,animation:"fadeIn .3s ease"},
+  pendingBadge:{background:"rgba(255,255,255,.25)",padding:"2px 8px",borderRadius:12,fontSize:11},
+  innerLayout:{display:"flex",flex:1,overflow:"hidden"},
+  sidebar:{width:220,background:"#0f172a",display:"flex",flexDirection:"column",padding:"20px 10px",gap:4,flexShrink:0},
+  sideTop:{display:"flex",alignItems:"center",gap:10,padding:"0 8px 16px",borderBottom:"1px solid #1e293b",marginBottom:8},
+  siName:{color:"#f1f5f9",fontWeight:700,fontSize:13}, siRole:{color:"#64748b",fontSize:11,marginTop:2},
+  pratSel:{padding:"6px 8px",background:"#1e293b",color:"#94a3b8",border:"1px solid #334155",borderRadius:6,fontSize:12,outline:"none",cursor:"pointer"},
+  navBtn:{display:"flex",alignItems:"center",gap:8,padding:"9px 12px",borderRadius:8,border:"none",background:"transparent",color:"#94a3b8",cursor:"pointer",fontSize:13,fontWeight:500,textAlign:"left"},
+  navOn:{background:"#1e40af",color:"#fff"},
+  syncBtn:{padding:"6px 10px",background:"#0ea5e9",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:600,width:"100%",marginBottom:4},
+  logoutBtn:{padding:"7px 12px",background:"transparent",border:"1px solid #334155",borderRadius:6,color:"#94a3b8",cursor:"pointer",fontSize:11,width:"100%"},
+  main:{flex:1,overflow:"auto",padding:28},
+  loader:{display:"flex",alignItems:"center",justifyContent:"center",height:"60vh",color:"#94a3b8",fontSize:18},
   loginBg:{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"linear-gradient(135deg,#0f172a,#1e3a5f)"},
   loginCard:{background:"#fff",borderRadius:20,padding:"48px 40px",width:360,textAlign:"center",boxShadow:"0 25px 60px rgba(0,0,0,.35)"},
   loginTitle:{fontSize:22,fontWeight:800,color:"#0f172a",margin:"0 0 4px"},
-
-  // ── Dashboard ──
-  pageTitle:{fontSize:20,fontWeight:800,color:"#0f172a",margin:"0 0 16px"},
-  pageHdr:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16},
-  statsGrid:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:14,marginBottom:20},
-  statCard:{background:"#fff",borderRadius:12,padding:"16px 18px",display:"flex",alignItems:"center",gap:12,borderLeft:"4px solid",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
-  statVal:{fontSize:20,fontWeight:800}, statLbl:{fontSize:12,color:"#64748b",marginTop:3},
-
-  // ── Vue patients (split) ──
-  splitView:{display:"flex",gap:12,flex:1,overflow:"hidden",padding:"12px 16px"},
-  leftPane:{width:255,background:"#fff",borderRadius:10,display:"flex",flexDirection:"column",overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,.06)",flexShrink:0},
-  rightPane:{flex:1,background:"#fff",borderRadius:10,overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
-  paneHdr:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 12px 6px"},
-  searchBox:{margin:"0 8px 6px",padding:"6px 10px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:12,outline:"none"},
-  scrollList:{overflow:"auto",flex:1,padding:"0 5px 5px"},
-  patRow:{display:"flex",alignItems:"center",gap:8,padding:"8px 7px",borderRadius:7,cursor:"pointer"},
+  pageTitle:{fontSize:22,fontWeight:800,color:"#0f172a",margin:"0 0 20px"},
+  pageHdr:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20},
+  statsGrid:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:16,marginBottom:24},
+  statCard:{background:"#fff",borderRadius:12,padding:"18px 20px",display:"flex",alignItems:"center",gap:14,borderLeft:"4px solid",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
+  statVal:{fontSize:22,fontWeight:800}, statLbl:{fontSize:12,color:"#64748b",marginTop:4},
+  splitView:{display:"flex",gap:16,height:"calc(100vh - 80px)"},
+  leftPane:{width:265,background:"#fff",borderRadius:12,display:"flex",flexDirection:"column",overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,.06)",flexShrink:0},
+  rightPane:{flex:1,background:"#fff",borderRadius:12,overflow:"auto",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
+  paneHdr:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"13px 13px 8px"},
+  searchBox:{margin:"0 10px 8px",padding:"7px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none"},
+  scrollList:{overflow:"auto",flex:1,padding:"0 6px 6px"},
+  patRow:{display:"flex",alignItems:"center",gap:10,padding:"9px 8px",borderRadius:8,cursor:"pointer"},
   patRowOn:{background:"#eff6ff"},
-  avatar:{width:34,height:34,borderRadius:"50%",background:"#1e40af",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,flexShrink:0},
+  avatar:{width:36,height:36,borderRadius:"50%",background:"#1e40af",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,flexShrink:0},
   patName:{fontSize:13,fontWeight:600,color:"#0f172a"}, patSub:{fontSize:11,color:"#94a3b8"},
-  emptyDetail:{display:"flex",alignItems:"center",justifyContent:"center",height:"100%",color:"#94a3b8",fontSize:14},
-
-  // ── Fiche patient ──
-  ficheWrap:{padding:"14px 18px"},
-  ficheHead:{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:8},
-  ficheTitle:{fontSize:18,fontWeight:800,color:"#0f172a",margin:0},
-  infoGrid:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12},
-  infoBox:{background:"#f8fafc",borderRadius:7,padding:"7px 11px"},
-  infoKey:{fontSize:11,color:"#64748b",marginBottom:2}, infoVal:{fontSize:13,color:"#0f172a",fontWeight:500},
-  finSummary:{background:"linear-gradient(135deg,#eff6ff,#f0fdf4)",border:"1px solid #bfdbfe",borderRadius:10,padding:"10px 14px",marginBottom:14},
-  finItem:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 0",borderBottom:"1px solid rgba(0,0,0,.06)",fontSize:13},
-  secTitle:{fontSize:14,fontWeight:700,color:"#0f172a",borderBottom:"2px solid #e2e8f0",paddingBottom:6,marginBottom:10,marginTop:4},
-
-  // ── Actes ──
-  treatCard:{background:"#f8fafc",borderRadius:9,padding:"11px 13px",marginBottom:10,border:"1px solid #e2e8f0"},
-  treatHead:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:6},
+  emptyDetail:{display:"flex",alignItems:"center",justifyContent:"center",height:"100%",color:"#94a3b8",fontSize:15},
+  ficheWrap:{padding:22},
+  ficheHead:{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:10},
+  ficheTitle:{fontSize:20,fontWeight:800,color:"#0f172a",margin:0},
+  infoGrid:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:18},
+  infoBox:{background:"#f8fafc",borderRadius:8,padding:"9px 13px"},
+  infoKey:{fontSize:11,color:"#64748b",marginBottom:3}, infoVal:{fontSize:13,color:"#0f172a",fontWeight:500},
+  finSummary:{background:"linear-gradient(135deg,#eff6ff,#f0fdf4)",border:"1px solid #bfdbfe",borderRadius:12,padding:"14px 18px",marginBottom:20},
+  finItem:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid rgba(0,0,0,.06)",fontSize:14},
+  secTitle:{fontSize:15,fontWeight:700,color:"#0f172a",borderBottom:"2px solid #e2e8f0",paddingBottom:8,marginBottom:14},
+  treatCard:{background:"#f8fafc",borderRadius:10,padding:"13px 15px",marginBottom:12,border:"1px solid #e2e8f0"},
+  treatHead:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8},
   table:{width:"100%",borderCollapse:"collapse",fontSize:12},
-  th:{padding:"5px 7px",textAlign:"left",color:"#64748b",fontWeight:700,fontSize:11},
-  td:{padding:"6px 7px",color:"#374151",verticalAlign:"middle"},
-  treatFoot:{marginTop:6,fontSize:11,color:"#64748b",borderTop:"1px solid #e2e8f0",paddingTop:5},
-  btnTerminer:{marginTop:6,padding:"4px 12px",background:"#f0fdf4",color:"#166534",border:"1px solid #bbf7d0",borderRadius:7,cursor:"pointer",fontSize:11,fontWeight:600},
-  acteCard:{background:"#fff",borderRadius:10,padding:"12px 15px",marginBottom:10,borderLeft:"4px solid #1e40af",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
-  acteCardHd:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8},
-  seanceRow:{display:"flex",alignItems:"center",gap:6,padding:"5px 7px",background:"#f8fafc",borderRadius:5,marginBottom:2,fontSize:12},
-  filterSel:{padding:"7px 10px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:12,marginBottom:12,outline:"none",background:"#fff"},
-
-  // ── Actes page wrapper (scroll) ──
-  actesWrap:{flex:1,overflow:"auto",padding:"12px 16px"},
-
-  // ── Commun ──
-  pill:(bg,col)=>({background:bg,color:col,padding:"2px 7px",borderRadius:10,fontSize:11,fontWeight:600,whiteSpace:"nowrap"}),
-  sBadge:{padding:"2px 9px",borderRadius:18,fontSize:11,fontWeight:600},
-  itemCard:{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:9,padding:"12px",marginBottom:8},
-  infoChip:{padding:"7px 11px",background:"#eff6ff",borderRadius:7,fontSize:12,color:"#1e40af"},
-  modeRow:{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap"},
-  modeBtn:{flex:1,padding:"9px",border:"2px solid #e2e8f0",borderRadius:7,background:"#fff",cursor:"pointer",fontSize:12,fontWeight:500,minWidth:140},
+  th:{padding:"6px 8px",textAlign:"left",color:"#64748b",fontWeight:700,fontSize:11},
+  td:{padding:"7px 8px",color:"#374151",verticalAlign:"middle"},
+  treatFoot:{marginTop:8,fontSize:12,color:"#64748b",borderTop:"1px solid #e2e8f0",paddingTop:7},
+  btnTerminer:{marginTop:8,padding:"5px 14px",background:"#f0fdf4",color:"#166534",border:"1px solid #bbf7d0",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600},
+  acteCard:{background:"#fff",borderRadius:12,padding:"14px 17px",marginBottom:12,borderLeft:"4px solid #1e40af",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
+  acteCardHd:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10},
+  seanceRow:{display:"flex",alignItems:"center",gap:7,padding:"6px 8px",background:"#f8fafc",borderRadius:6,marginBottom:3,fontSize:12},
+  filterSel:{padding:"8px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,marginBottom:16,outline:"none",background:"#fff"},
+  pill:(bg,col)=>({background:bg,color:col,padding:"2px 8px",borderRadius:12,fontSize:11,fontWeight:600,whiteSpace:"nowrap"}),
+  sBadge:{padding:"2px 10px",borderRadius:20,fontSize:11,fontWeight:600},
+  itemCard:{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"14px",marginBottom:10},
+  infoChip:{padding:"8px 12px",background:"#eff6ff",borderRadius:8,fontSize:12,color:"#1e40af"},
+  modeRow:{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"},
+  modeBtn:{flex:1,padding:"10px",border:"2px solid #e2e8f0",borderRadius:8,background:"#fff",cursor:"pointer",fontSize:13,fontWeight:500,minWidth:150},
   modeBtnOn:{borderColor:"#1e40af",background:"#eff6ff",color:"#1e40af"},
-  btnBlue:{padding:"7px 14px",background:"#1e40af",color:"#fff",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600,whiteSpace:"nowrap"},
-  btnGray:{padding:"7px 14px",background:"#f1f5f9",color:"#374151",border:"1px solid #e2e8f0",borderRadius:7,cursor:"pointer",fontSize:12},
-  btnRed:{padding:"7px 12px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600},
-  btnRedSm:{padding:"3px 7px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:5,cursor:"pointer",fontSize:11,flexShrink:0},
-  btnEditSm:{padding:"3px 7px",background:"#eff6ff",color:"#1e40af",border:"none",borderRadius:5,cursor:"pointer",fontSize:11,flexShrink:0},
-  empty:{textAlign:"center",color:"#94a3b8",padding:"24px 0",fontSize:13},
-  fGroup:{display:"flex",flexDirection:"column",gap:4,marginBottom:10,flex:1},
-  formRow:{display:"flex",gap:10},
+  btnBlue:{padding:"8px 16px",background:"#1e40af",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600,whiteSpace:"nowrap"},
+  btnGray:{padding:"8px 16px",background:"#f1f5f9",color:"#374151",border:"1px solid #e2e8f0",borderRadius:8,cursor:"pointer",fontSize:13},
+  btnRed:{padding:"8px 14px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600},
+  btnRedSm:{padding:"4px 8px",background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:6,cursor:"pointer",fontSize:12,flexShrink:0},
+  btnEditSm:{padding:"4px 8px",background:"#eff6ff",color:"#1e40af",border:"none",borderRadius:6,cursor:"pointer",fontSize:12,flexShrink:0},
+  empty:{textAlign:"center",color:"#94a3b8",padding:"28px 0",fontSize:14},
+  fGroup:{display:"flex",flexDirection:"column",gap:4,marginBottom:12,flex:1},
+  formRow:{display:"flex",gap:12},
   fLabel:{fontSize:12,fontWeight:600,color:"#374151"},
-  fInput:{padding:"7px 11px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#fff"},
-  fTextarea:{padding:"7px 11px",borderRadius:7,border:"1px solid #e2e8f0",fontSize:13,outline:"none",resize:"vertical",background:"#fff"},
+  fInput:{padding:"8px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",background:"#fff"},
+  fTextarea:{padding:"8px 12px",borderRadius:8,border:"1px solid #e2e8f0",fontSize:13,outline:"none",resize:"vertical",background:"#fff"},
   overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16},
-  modalBox:{background:"#fff",borderRadius:14,width:"100%",maxWidth:480,maxHeight:"92vh",overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,.25)"},
-  modalHd:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 18px 11px",borderBottom:"1px solid #f1f5f9"},
-  modalBd:{padding:"16px 18px",overflow:"auto"},
-  mAct:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:14},
+  modalBox:{background:"#fff",borderRadius:16,width:"100%",maxWidth:480,maxHeight:"92vh",overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,.25)"},
+  modalHd:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px 13px",borderBottom:"1px solid #f1f5f9"},
+  modalBd:{padding:"18px 20px",overflow:"auto"},
+  mAct:{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16},
 };
