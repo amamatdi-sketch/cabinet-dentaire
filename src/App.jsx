@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const SUPABASE_URL = "https://jeidktusskhegocpppw.supabase.co";
+const SUPABASE_URL = "https://jeidktusskhegopcpppw.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplaWRrdHVzc2toZWdvcGNwcHB3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4NTYyODksImV4cCI6MjA5NTQzMjI4OX0.Rzq8yB04besi2RzjbNKB96C5vO6J5QLS5tWaC3dSuVg";   // ← gardez votre clé
 const LOGIN_USER   = "admin";                      // ← changez le nom d'utilisateur
 const LOGIN_PASS   = "cabinet2026";                // ← changez le mot de passe
